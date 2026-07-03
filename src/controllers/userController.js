@@ -1,4 +1,5 @@
 const UserModel = require('../models/userModel');
+const sendEmail = require('../utils/emailService');
 
 // ====================== GET ALL MANAGERS (Admin Only) ======================
 const getAllManagers = async (req, res) => {
