@@ -31,6 +31,12 @@ const userSchema = new mongoose.Schema({
         required: true
     },
 
+    access: {
+        type: [String],
+        enum: [null, 'head movement', 'hand movement'],
+        default: null
+    },
+
     createdBy: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User',

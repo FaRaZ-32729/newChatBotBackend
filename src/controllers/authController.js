@@ -72,9 +72,85 @@ const createAdmin = async (req, res) => {
 };
 
 // ====================== CREATE USER (Manager/User) ======================
+// const createUser = async (req, res) => {
+//     try {
+//         const { name, email } = req.body;
+//         const creator = req.user;
+
+//         if (!name || !email) {
+//             return res.status(400).json({ success: false, message: "Name and email are required" });
+//         }
+
+//         // Email validation
+//         const emailRegex = /^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/;
+//         if (!emailRegex.test(email)) {
+//             return res.status(400).json({ success: false, message: "Please provide a valid email address" });
+//         }
+
+//         const existingUser = await UserModel.findOne({ email });
+//         if (existingUser) {
+//             return res.status(409).json({ success: false, message: "Email already registered" });
+//         }
+
+//         let roleToAssign = creator.role === 'admin' ? 'manager' : 'user';
+
+//         if (creator.role !== 'admin' && creator.role !== 'manager') {
+//             return res.status(403).json({ success: false, message: "Unauthorized to create users" });
+//         }
+
+//         // Create user object but DO NOT save yet
+//         const newUser = new UserModel({
+//             name: name.trim(),
+//             email: email.toLowerCase().trim(),
+//             role: roleToAssign,
+//             createdBy: creator._id,
+//             isActive: false,
+//             verified: false
+//         });
+
+//         const otp = newUser.generateOTP();
+
+//         // Prepare Email
+//         const verificationLink = `${process.env.FRONTEND_URL}/verify-otp?email=${email.toLowerCase()}`;
+
+//         const emailHTML = `
+//             <h2>Welcome to Chatbot</h2>
+//             <p>Hello ${name},</p>
+//             <p>Your account has been created by ${creator.name} (${creator.role}).</p>
+//             <p>Your OTP is: <strong>${otp}</strong></p>
+//             <p>This OTP expires in 15 minutes.</p>
+//             <p><a href="${verificationLink}" style="padding:12px 24px; background:#007bff; color:white; text-decoration:none; border-radius:4px;">Verify Account</a></p>
+//         `;
+
+//         // Send Email FIRST
+//         await sendEmail(email, "Verify Your Chatbot Account", emailHTML);
+
+//         // If email sent successfully, then save to database
+//         await newUser.save();
+
+//         res.status(201).json({
+//             success: true,
+//             message: `New ${roleToAssign} created successfully. Verification email sent.`,
+//             data: { userId: newUser._id, email: newUser.email }
+//         });
+
+//     } catch (error) {
+//         console.error("Create User Error:", error);
+
+//         if (error.code === 'EAUTH' || error.message.includes('SMTP')) {
+//             return res.status(500).json({
+//                 success: false,
+//                 message: "Failed to send verification email. Please check SMTP settings."
+//             });
+//         }
+
+//         res.status(500).json({ success: false, message: "Server error while creating user" });
+//     }
+// };
+
 const createUser = async (req, res) => {
     try {
-        const { name, email } = req.body;
+        const { name, email, access } = req.body;   // ← access added
         const creator = req.user;
 
         if (!name || !email) {
@@ -98,14 +174,35 @@ const createUser = async (req, res) => {
             return res.status(403).json({ success: false, message: "Unauthorized to create users" });
         }
 
-        // Create user object but DO NOT save yet
+        // Access Validation & Inheritance Logic
+        let userAccess = null;
+
+        if (creator.role === 'admin') {
+            // Admin can set access for manager
+            const validAccess = [null, 'head movement', 'hand movement'];
+
+            if (access !== undefined && !validAccess.includes(access)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Access must be 'head movement' or 'hand movement'"
+                });
+            }
+            userAccess = access || null;
+        }
+        else if (creator.role === 'manager') {
+            // Manager's users inherit the same access as manager
+            userAccess = creator.access;
+        }
+
+        // Create user object
         const newUser = new UserModel({
             name: name.trim(),
             email: email.toLowerCase().trim(),
             role: roleToAssign,
             createdBy: creator._id,
             isActive: false,
-            verified: false
+            verified: false,
+            access: userAccess
         });
 
         const otp = newUser.generateOTP();
@@ -125,13 +222,17 @@ const createUser = async (req, res) => {
         // Send Email FIRST
         await sendEmail(email, "Verify Your Chatbot Account", emailHTML);
 
-        // If email sent successfully, then save to database
+        // Save to database after email success
         await newUser.save();
 
         res.status(201).json({
             success: true,
             message: `New ${roleToAssign} created successfully. Verification email sent.`,
-            data: { userId: newUser._id, email: newUser.email }
+            data: {
+                userId: newUser._id,
+                email: newUser.email,
+                access: newUser.access
+            }
         });
 
     } catch (error) {
@@ -312,9 +413,9 @@ const toggleUserStatus = async (req, res) => {
         if (!isActive && user.role === 'manager') {
             await UserModel.updateMany(
                 { createdBy: user._id, role: 'user' },
-                { 
-                    isActive: false, 
-                    suspensionReason: `Deactivated because your manager (${user.name}) was suspended` 
+                {
+                    isActive: false,
+                    suspensionReason: `Deactivated because your manager (${user.name}) was suspended`
                 }
             );
         }
