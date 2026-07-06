@@ -5,11 +5,13 @@ const router = express.Router();
 // Import all module routes
 const authRoutes = require("./authRoutes");
 const userRoutes = require("./userRoutes");
+const chatbotRoutes = require("./chatbotRoutes");
 
 
 // Mount all routes with proper prefixes
 router.use("/auth", authRoutes);
 router.use("/users", userRoutes);
+router.use("/chatbot", chatbotRoutes);
 
 
 // Health check route

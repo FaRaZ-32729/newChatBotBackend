@@ -3,6 +3,7 @@ const dotenv = require("dotenv");
 const dbConnection = require("./src/config/dbConnection");
 const cookieParser = require("cookie-parser");
 const cors = require("cors");
+const path = require("path");
 
 // Routers
 const centeralRoutes = require("./src/routes/centeralRoutes");
@@ -32,6 +33,9 @@ app.use(cors({
     },
     credentials: true
 }));
+
+// Make uploads folder public
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 
 
