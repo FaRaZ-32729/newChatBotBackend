@@ -12,6 +12,24 @@ const generateToken = (user) => {
     );
 };
 
+// Helper: Generate Unique 6-digit Session ID
+const generateSessionId = async () => {
+    let sessionId;
+    let isUnique = false;
+
+    while (!isUnique) {
+        // Generate 6 digit random number (100000 - 999999)
+        sessionId = Math.floor(100000 + Math.random() * 900000).toString();
+
+        const existing = await UserModel.findOne({ sessionId });
+        if (!existing) {
+            isUnique = true;
+        }
+    }
+
+    return sessionId;
+};
+
 // Password Strength Regex: Minimum 8 chars, 1 uppercase, 1 lowercase, 1 number, 1 special char
 const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
 
@@ -44,6 +62,9 @@ const createAdmin = async (req, res) => {
             return res.status(409).json({ success: false, message: "Email already exists" });
         }
 
+        // generates unique session id
+        const sessionId = await generateSessionId();
+
         // Hash password
         const salt = await bcrypt.genSalt(12);
         const hashedPassword = await bcrypt.hash(password, salt);
@@ -55,7 +76,9 @@ const createAdmin = async (req, res) => {
             role: 'admin',
             createdBy: null,
             isActive: true,
-            verified: true
+            verified: true,
+            sessionId: sessionId,
+            access: null
         });
 
         await admin.save();
@@ -72,82 +95,6 @@ const createAdmin = async (req, res) => {
 };
 
 // ====================== CREATE USER (Manager/User) ======================
-// const createUser = async (req, res) => {
-//     try {
-//         const { name, email } = req.body;
-//         const creator = req.user;
-
-//         if (!name || !email) {
-//             return res.status(400).json({ success: false, message: "Name and email are required" });
-//         }
-
-//         // Email validation
-//         const emailRegex = /^\w+([.-]?\w+)*@\w+([.-]?\w+)*(\.\w{2,3})+$/;
-//         if (!emailRegex.test(email)) {
-//             return res.status(400).json({ success: false, message: "Please provide a valid email address" });
-//         }
-
-//         const existingUser = await UserModel.findOne({ email });
-//         if (existingUser) {
-//             return res.status(409).json({ success: false, message: "Email already registered" });
-//         }
-
-//         let roleToAssign = creator.role === 'admin' ? 'manager' : 'user';
-
-//         if (creator.role !== 'admin' && creator.role !== 'manager') {
-//             return res.status(403).json({ success: false, message: "Unauthorized to create users" });
-//         }
-
-//         // Create user object but DO NOT save yet
-//         const newUser = new UserModel({
-//             name: name.trim(),
-//             email: email.toLowerCase().trim(),
-//             role: roleToAssign,
-//             createdBy: creator._id,
-//             isActive: false,
-//             verified: false
-//         });
-
-//         const otp = newUser.generateOTP();
-
-//         // Prepare Email
-//         const verificationLink = `${process.env.FRONTEND_URL}/verify-otp?email=${email.toLowerCase()}`;
-
-//         const emailHTML = `
-//             <h2>Welcome to Chatbot</h2>
-//             <p>Hello ${name},</p>
-//             <p>Your account has been created by ${creator.name} (${creator.role}).</p>
-//             <p>Your OTP is: <strong>${otp}</strong></p>
-//             <p>This OTP expires in 15 minutes.</p>
-//             <p><a href="${verificationLink}" style="padding:12px 24px; background:#007bff; color:white; text-decoration:none; border-radius:4px;">Verify Account</a></p>
-//         `;
-
-//         // Send Email FIRST
-//         await sendEmail(email, "Verify Your Chatbot Account", emailHTML);
-
-//         // If email sent successfully, then save to database
-//         await newUser.save();
-
-//         res.status(201).json({
-//             success: true,
-//             message: `New ${roleToAssign} created successfully. Verification email sent.`,
-//             data: { userId: newUser._id, email: newUser.email }
-//         });
-
-//     } catch (error) {
-//         console.error("Create User Error:", error);
-
-//         if (error.code === 'EAUTH' || error.message.includes('SMTP')) {
-//             return res.status(500).json({
-//                 success: false,
-//                 message: "Failed to send verification email. Please check SMTP settings."
-//             });
-//         }
-
-//         res.status(500).json({ success: false, message: "Server error while creating user" });
-//     }
-// };
-
 const createUser = async (req, res) => {
     try {
         const { name, email, access } = req.body;   // ← access added
@@ -194,6 +141,9 @@ const createUser = async (req, res) => {
             userAccess = creator.access;
         }
 
+        // generate unique session id
+        const sessionId = await generateSessionId();
+
         // Create user object
         const newUser = new UserModel({
             name: name.trim(),
@@ -202,7 +152,8 @@ const createUser = async (req, res) => {
             createdBy: creator._id,
             isActive: false,
             verified: false,
-            access: userAccess
+            access: userAccess,
+            sessionId: sessionId
         });
 
         const otp = newUser.generateOTP();
