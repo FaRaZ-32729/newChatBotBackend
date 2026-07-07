@@ -21,7 +21,16 @@ const chatbotSchema = new mongoose.Schema({
         uploadedAt: {
             type: Date,
             default: Date.now
-        }
+        },
+        extractedImages: [{                     // ← Yeh field add kiya
+            imageName: String,
+            imageUrl: String,
+            pageNumber: Number,
+            mainHeading: String,
+            sectionHeading: String,
+            subHeading: String,
+            contextText: String,
+        }]
     }],
 
     activationKey: {
