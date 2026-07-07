@@ -23,7 +23,9 @@
     "nodemailer": "^9.0.3",
     "nodemon": "^3.1.14",
     "pdf-lib": "^1.17.1",
-    "pdf2pic": "^3.2.0",
-    "sharp": "^0.35.3"
+    "pdf-poppler": "^0.2.3",
+    "pdf2json": "^4.0.3",
+    "sharp": "^0.35.3",
+    "uuid": "^14.0.1"
   }
 }

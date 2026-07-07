@@ -46,12 +46,6 @@ const createChatbot = async (req, res) => {
 
         const chatbotFolderName = name.replace(/[^a-zA-Z0-9]/g, '_');
 
-        // const knowledgeBasePdfs = pdfFiles.map(file => ({
-        //     name: file.originalname,
-        //     url: `/uploads/chatbots/${chatbotFolderName}/${file.filename}`,
-        //     size: (file.size / (1024 * 1024)).toFixed(2) + ' MB'
-        // }));
-
         const knowledgeBasePdfs = [];
 
         for (const pdfFile of pdfFiles) {
