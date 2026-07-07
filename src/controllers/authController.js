@@ -125,16 +125,22 @@ const createUser = async (req, res) => {
         let userAccess = null;
 
         if (creator.role === 'admin') {
-            // Admin can set access for manager
-            const validAccess = [null, 'head movement', 'hand movement'];
+            const validAccess = ['head movement', 'hand movement'];
 
-            if (access !== undefined && !validAccess.includes(access)) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Access must be 'head movement' or 'hand movement'"
-                });
+            if (access !== undefined && access !== null) {
+                const accessList = Array.isArray(access) ? access : [access];
+
+                if (accessList.length > 0) {
+                    const invalid = accessList.filter((item) => !validAccess.includes(item));
+                    if (invalid.length > 0) {
+                        return res.status(400).json({
+                            success: false,
+                            message: "Access must be 'head movement' and/or 'hand movement'"
+                        });
+                    }
+                    userAccess = [...new Set(accessList)];
+                }
             }
-            userAccess = access || null;
         }
         else if (creator.role === 'manager') {
             // Manager's users inherit the same access as manager
@@ -215,22 +221,21 @@ const verifyOTP = async (req, res) => {
             return res.status(404).json({ success: false, message: "User not found" });
         }
 
-        if (user.verified) {
-            return res.status(400).json({ success: false, message: "User already verified" });
-        }
-
         if (!user.otp || !user.otpExpiry || Date.now() > user.otpExpiry) {
-            return res.status(400).json({ success: false, message: "OTP expired or invalid" });
+            return res.status(400).json({ success: false, message: "OTP expired" });
         }
 
         if (user.otp !== otp) {
             return res.status(400).json({ success: false, message: "Invalid OTP" });
         }
 
-        // Mark as verified
-        user.verified = true;
         user.otp = undefined;
         user.otpExpiry = undefined;
+
+        if (!user.verified) {
+            user.verified = true;
+        }
+
         await user.save();
 
         res.status(200).json({
@@ -239,6 +244,58 @@ const verifyOTP = async (req, res) => {
         });
     } catch (error) {
         console.error(error);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+// @desc    Forgot Password - send OTP to verified active users
+const forgotPassword = async (req, res) => {
+    try {
+        const { email } = req.body;
+
+        if (!email) {
+            return res.status(400).json({ success: false, message: "Email is required" });
+        }
+
+        const user = await UserModel.findOne({ email: email.toLowerCase().trim() });
+
+        if (!user) {
+            return res.status(404).json({ success: false, message: "User not found" });
+        }
+
+        if (!user.verified || !user.isActive) {
+            return res.status(400).json({ success: false, message: "Account is not active." });
+        }
+
+        const otp = user.generateOTP();
+        await user.save();
+
+        const verificationLink = `${process.env.FRONTEND_URL}/verify-otp?email=${user.email}`;
+
+        const emailHTML = `
+            <h2>Password Reset Request</h2>
+            <p>Hello ${user.name},</p>
+            <p>Your password reset OTP is: <strong>${otp}</strong></p>
+            <p>This OTP expires in 15 minutes.</p>
+            <p><a href="${verificationLink}" style="padding:12px 24px; background:#007bff; color:white; text-decoration:none; border-radius:4px;">Verify OTP & Set New Password</a></p>
+        `;
+
+        await sendEmail(user.email, "Password Reset OTP", emailHTML);
+
+        res.status(200).json({
+            success: true,
+            message: "Password reset OTP sent to your email."
+        });
+    } catch (error) {
+        console.error("Forgot Password Error:", error);
+
+        if (error.code === 'EAUTH' || error.message.includes('SMTP')) {
+            return res.status(500).json({
+                success: false,
+                message: "Failed to send password reset email. Please check SMTP settings."
+            });
+        }
+
         res.status(500).json({ success: false, message: "Server error" });
     }
 };
@@ -253,20 +310,31 @@ const regenerateOTP = async (req, res) => {
             return res.status(404).json({ success: false, message: "User not found" });
         }
 
-        if (user.verified) {
-            return res.status(400).json({ success: false, message: "User already verified" });
+        if (user.verified && !user.isActive) {
+            return res.status(400).json({ success: false, message: "Account is not active." });
         }
 
         const otp = user.generateOTP();
         await user.save();
 
-        const emailHTML = `
+        const verificationLink = `${process.env.FRONTEND_URL}/verify-otp?email=${user.email}`;
+        const emailSubject = user.verified ? "New Password Reset OTP" : "New OTP - LuckyOneMall";
+        const emailHTML = user.verified
+            ? `
+            <h2>New Password Reset OTP</h2>
+            <p>Hello ${user.name},</p>
+            <p>Your new password reset OTP is: <strong>${otp}</strong></p>
+            <p>This OTP is valid for 15 minutes.</p>
+            <p><a href="${verificationLink}">Verify OTP & Set New Password</a></p>
+        `
+            : `
             <h2>New OTP Request</h2>
             <p>Your new OTP is: <strong>${otp}</strong></p>
             <p>This OTP is valid for 15 minutes.</p>
+            <p><a href="${verificationLink}">Verify Account</a></p>
         `;
 
-        await sendEmail(email, "New OTP - LuckyOneMall", emailHTML);
+        await sendEmail(email, emailSubject, emailHTML);
 
         res.status(200).json({ success: true, message: "New OTP sent successfully" });
     } catch (error) {
@@ -467,8 +535,13 @@ const login = async (req, res) => {
 
 // logout user 
 const logout = async (req, res) => {
-    try {
-        res.clearCookie("token", { httpOnly: true, sameSite: "none", path: "/", secure: true });
+    try {;
+        res.clearCookie('token', {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'strict',
+            path: '/',
+        });
         res.status(200).json({ success: true, message: "Logged out successfully" });
     } catch (error) {
         console.error("Error in logout:", error);
@@ -480,6 +553,7 @@ module.exports = {
     createAdmin,
     createUser,
     verifyOTP,
+    forgotPassword,
     regenerateOTP,
     setPassword,
     login,

@@ -4,6 +4,7 @@ const {
     createAdmin,
     createUser,
     verifyOTP,
+    forgotPassword,
     regenerateOTP,
     setPassword,
     login,
@@ -16,6 +17,7 @@ const authenticate = require('../middlewares/auth');
 router.post('/create-admin', createAdmin);
 router.post('/create', authenticate, createUser);
 router.post('/verify-otp', verifyOTP);
+router.post('/forgot-password', forgotPassword);
 router.post('/regenerate-otp', regenerateOTP);
 router.post('/set-password', setPassword);
 router.put('/toggle-status', authenticate, toggleUserStatus);

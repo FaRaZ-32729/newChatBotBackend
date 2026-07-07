@@ -12,7 +12,7 @@ const getAllManagers = async (req, res) => {
         }
 
         const managers = await UserModel.find({ role: 'manager' })
-            .select('name email isActive createdAt suspensionReason')
+            .select('name email isActive createdAt suspensionReason access')
             .sort({ createdAt: -1 });
 
         const total = managers.length;
@@ -189,20 +189,30 @@ const updateManager = async (req, res) => {
 
         // Update Access
         if (access !== undefined) {
-            const validAccess = [null, 'head movement', 'hand movement'];
-            if (!validAccess.includes(access)) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Access must be null, 'head movement' or 'hand movement'"
-                });
+            const validAccess = ['head movement', 'hand movement'];
+
+            if (access === null) {
+                manager.access = null;
+            } else {
+                const accessList = Array.isArray(access) ? access : [access];
+
+                if (accessList.length > 0) {
+                    const invalid = accessList.filter((item) => !validAccess.includes(item));
+                    if (invalid.length > 0) {
+                        return res.status(400).json({
+                            success: false,
+                            message: "Access must be 'head movement' and/or 'hand movement'"
+                        });
+                    }
+                    manager.access = [...new Set(accessList)];
+                } else {
+                    manager.access = null;
+                }
             }
 
-            manager.access = access;
-
-            // Update all sub-users' access
             await UserModel.updateMany(
                 { createdBy: manager._id, role: 'user' },
-                { access: access }
+                { access: manager.access }
             );
 
             changesMade = true;
@@ -289,9 +299,45 @@ const updateManager = async (req, res) => {
     }
 };
 
+// ====================== DELETE MANAGER (Admin Only) ======================
+const deleteManager = async (req, res) => {
+    try {
+        const { managerId } = req.params;
+
+        if (req.user.role !== 'admin') {
+            return res.status(403).json({
+                success: false,
+                message: "Only admin can delete managers"
+            });
+        }
+
+        const manager = await UserModel.findById(managerId);
+
+        if (!manager) {
+            return res.status(404).json({ success: false, message: "Manager not found" });
+        }
+
+        if (manager.role !== 'manager') {
+            return res.status(400).json({ success: false, message: "This user is not a manager" });
+        }
+
+        await UserModel.deleteMany({ createdBy: manager._id, role: 'user' });
+        await UserModel.findByIdAndDelete(managerId);
+
+        res.status(200).json({
+            success: true,
+            message: "Manager deleted successfully"
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
 module.exports = {
     getAllManagers,
     getUsersByManager,
     getUserById,
-    updateManager
+    updateManager,
+    deleteManager
 };
