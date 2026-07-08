@@ -5,6 +5,7 @@ const {
     getAllManagers,
     getUsersByManager,
     getUserById,
+    getManagerDetails,
     updateManager,
     deleteManager,
     deleteClientUser
@@ -12,6 +13,8 @@ const {
 
 router.get('/managers', authenticate, getAllManagers);
 router.get('/by/:managerId/', authenticate, getUsersByManager);
+// Full manager page data for admin (chatbots + users together)
+router.get('/manager-details/:managerId', authenticate, getManagerDetails);
 router.get('/:id', authenticate, getUserById);
 router.put('/update/:managerId', authenticate, updateManager);
 router.delete('/delete/:managerId', authenticate, deleteManager);

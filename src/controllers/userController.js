@@ -1,4 +1,5 @@
 const UserModel = require('../models/userModel');
+const ChatbotModel = require('../models/chatbotModel');
 const sendEmail = require('../utils/emailService');
 
 // ====================== GET ALL MANAGERS (Admin Only) ======================
@@ -327,6 +328,72 @@ const deleteManager = async (req, res) => {
     }
 };
 
+// ====================== GET MANAGER FULL DETAILS (Admin Only) ======================
+// One place for admin to see:
+// - that manager's profile
+// - all chatbots under that manager
+// - all users that manager created
+const getManagerDetails = async (req, res) => {
+    try {
+        const { managerId } = req.params;
+
+        // Only admin can open this full detail view
+        if (req.user.role !== 'admin') {
+            return res.status(403).json({
+                success: false,
+                message: "Only admin can view manager details"
+            });
+        }
+
+        // Find the manager first
+        const manager = await UserModel.findById(managerId)
+            .select('name email role isActive verified createdAt suspensionReason access');
+
+        if (!manager) {
+            return res.status(404).json({ success: false, message: "Manager not found" });
+        }
+
+        if (manager.role !== 'manager') {
+            return res.status(400).json({
+                success: false,
+                message: "This user is not a manager"
+            });
+        }
+
+        // Grab all chatbots that belong to this manager
+        // (includes ones created by his users, since createdBy stores manager id)
+        const chatbots = await ChatbotModel.find({
+            createdBy: managerId
+        }).sort({ createdAt: -1 });
+
+        // Grab all clients this manager created
+        const users = await UserModel.find({
+            createdBy: managerId,
+            role: 'user'
+        })
+            .select('name email isActive verified createdAt suspensionReason access')
+            .sort({ createdAt: -1 });
+
+        res.status(200).json({
+            success: true,
+            data: {
+                manager,
+                chatbots,
+                users,
+                stats: {
+                    totalChatbots: chatbots.length,
+                    totalUsers: users.length,
+                    activeUsers: users.filter(u => u.isActive).length,
+                    inactiveUsers: users.filter(u => !u.isActive).length
+                }
+            }
+        });
+    } catch (error) {
+        console.error("Get Manager Details Error:", error);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
 // ====================== DELETE CLIENT USER (Manager / Admin) ======================
 const deleteClientUser = async (req, res) => {
     try {
@@ -380,6 +447,7 @@ module.exports = {
     getAllManagers,
     getUsersByManager,
     getUserById,
+    getManagerDetails,
     updateManager,
     deleteManager,
     deleteClientUser
