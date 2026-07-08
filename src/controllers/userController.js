@@ -59,15 +59,8 @@ const getUsersByManager = async (req, res) => {
             createdBy: managerId,
             role: 'user'
         })
-            .select('name email isActive createdAt suspensionReason')
+            .select('name email isActive verified createdAt suspensionReason access')
             .sort({ createdAt: -1 });
-
-        if (users.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: "No users found for this manager"
-            });
-        }
 
         const total = users.length;
         const active = users.filter(u => u.isActive).length;
@@ -334,10 +327,60 @@ const deleteManager = async (req, res) => {
     }
 };
 
+// ====================== DELETE CLIENT USER (Manager / Admin) ======================
+const deleteClientUser = async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const currentUser = req.user;
+
+        if (currentUser.role !== 'manager' && currentUser.role !== 'admin') {
+            return res.status(403).json({
+                success: false,
+                message: "Only manager or admin can delete users"
+            });
+        }
+
+        const user = await UserModel.findById(userId);
+
+        if (!user) {
+            return res.status(404).json({ success: false, message: "User not found" });
+        }
+
+        if (user.role !== 'user') {
+            return res.status(400).json({
+                success: false,
+                message: "This endpoint can only delete client users"
+            });
+        }
+
+        // Manager can only delete users they created
+        if (
+            currentUser.role === 'manager' &&
+            user.createdBy?.toString() !== currentUser._id.toString()
+        ) {
+            return res.status(403).json({
+                success: false,
+                message: "You can only delete users you created"
+            });
+        }
+
+        await UserModel.findByIdAndDelete(userId);
+
+        res.status(200).json({
+            success: true,
+            message: "User deleted successfully"
+        });
+    } catch (error) {
+        console.error("Delete Client User Error:", error);
+        res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
 module.exports = {
     getAllManagers,
     getUsersByManager,
     getUserById,
     updateManager,
-    deleteManager
+    deleteManager,
+    deleteClientUser
 };

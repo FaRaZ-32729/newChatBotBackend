@@ -11,7 +11,7 @@ const ensureDir = (dirPath) => {
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         const chatbotName = req.body.name ? req.body.name.replace(/[^a-zA-Z0-9]/g, '_') : 'default';
-        const uploadPath = path.join(__dirname, '../uploads/chatbots', chatbotName);
+        const uploadPath = path.join(__dirname, '../../uploads/chatbots', chatbotName);
         ensureDir(uploadPath);
         cb(null, uploadPath);
     },
@@ -42,7 +42,7 @@ const fileFilter = (req, file, cb) => {
 const upload = multer({
     storage: storage,
     fileFilter: fileFilter,
-    limits: { fileSize: 15 * 1024 * 1024 } // Increased to 15MB
+    limits: { fileSize: 100 * 1024 * 1024 } // Increased to 15MB
 });
 
 module.exports = { upload, ensureDir };
