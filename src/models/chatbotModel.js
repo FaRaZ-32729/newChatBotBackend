@@ -84,6 +84,17 @@ const chatbotSchema = new mongoose.Schema({
     isActive: {
         type: Boolean,
         default: true
+    },
+
+    // Cached plain text from knowledgeBasePdfs (built once, reused by all voice sessions)
+    knowledgeTextCache: {
+        type: String,
+        default: ''
+    },
+
+    knowledgeCachedAt: {
+        type: Date,
+        default: null
     }
 
 }, {

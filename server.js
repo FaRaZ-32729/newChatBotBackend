@@ -1,54 +1,46 @@
-const express = require("express");
-const dotenv = require("dotenv");
-const dbConnection = require("./src/config/dbConnection");
-const cookieParser = require("cookie-parser");
-const cors = require("cors");
-const path = require("path");
+const http = require('http');
+const express = require('express');
+const dotenv = require('dotenv');
+const dbConnection = require('./src/config/dbConnection');
+const cookieParser = require('cookie-parser');
+const cors = require('cors');
+const path = require('path');
+const { initSocketServer } = require('./src/socket');
 
-// Routers
-const centeralRoutes = require("./src/routes/centeralRoutes");
+const centeralRoutes = require('./src/routes/centeralRoutes');
 
-// Utilities
 dotenv.config();
 dbConnection();
-
 
 const port = process.env.PORT || 5056;
 const app = express();
 
-// Middlewares
 const allowedOrigins = [
-    "https://iotfiy-ecosystem.vercel.app",
-    "http://localhost:5173"
+  'https://iotfiy-ecosystem.vercel.app',
+  'http://localhost:5173',
 ];
 
 app.use(cors({
-    origin: function (origin, callback) {
-        if (!origin) return callback(null, true); // allow mobile/postman
-        if (allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error("Not allowed by CORS"));
-        }
-    },
-    credentials: true
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
 }));
 
-// Make uploads folder public
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-
-
 app.use(express.json());
 app.use(cookieParser());
+app.use('/api', centeralRoutes);
 
+// HTTP + Socket.IO on same port for real-time voice
+const httpServer = http.createServer(app);
+initSocketServer(httpServer);
 
-
-// Routes
-app.use("/api", centeralRoutes);
-
-
-// Start server
-app.listen(port, () => {
-    console.log(`Express & WebSocket is running on port : ${port}`);
+httpServer.listen(port, () => {
+  console.log(`Express + Socket.IO running on port ${port}`);
 });

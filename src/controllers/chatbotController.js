@@ -152,6 +152,16 @@ const createChatbot = async (req, res) => {
 
             const saved = await newChatbot.save();
 
+            // Build PDF text cache in the background so first voice call is faster
+            setImmediate(async () => {
+                try {
+                    const { getChatbotKnowledge } = require('../llm/services/knowledgeService');
+                    await getChatbotKnowledge(saved);
+                } catch (cacheErr) {
+                    console.error('[chatbot] knowledge cache warm-up failed:', cacheErr.message);
+                }
+            });
+
             res.status(201).json({
                 success: true,
                 message: "Chatbot created successfully!",
@@ -259,10 +269,36 @@ const getChatbotsByUser = async (req, res) => {
     }
 };
 
+// ====================== GET PUBLIC CHATBOT (shareable URL) ======================
+// No login required — used when opening /chatbot/:id link
+const getPublicChatbot = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const chatbot = await ChatbotModel.findById(id).select('name onboardingImage isActive');
+
+        if (!chatbot || chatbot.isActive === false) {
+            return res.status(404).json({ success: false, message: 'Chatbot not found or inactive' });
+        }
+
+        res.status(200).json({
+            success: true,
+            data: {
+                _id: chatbot._id,
+                name: chatbot.name,
+                onboardingImage: chatbot.onboardingImage,
+            },
+        });
+    } catch (error) {
+        console.error('Get Public Chatbot Error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+};
+
 module.exports = {
     createChatbot,
     deleteChatbot,
-    getChatbotsByUser
+    getChatbotsByUser,
+    getPublicChatbot,
 };
 
 

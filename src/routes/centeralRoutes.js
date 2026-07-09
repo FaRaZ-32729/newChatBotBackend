@@ -6,12 +6,15 @@ const router = express.Router();
 const authRoutes = require("./authRoutes");
 const userRoutes = require("./userRoutes");
 const chatbotRoutes = require("./chatbotRoutes");
+const voiceRoutes = require("./voiceRoutes");
 
 
 // Mount all routes with proper prefixes
 router.use("/auth", authRoutes);
 router.use("/users", userRoutes);
 router.use("/chatbot", chatbotRoutes);
+// Voice / LLM routes live in their own folder tree under /api/voice
+router.use("/voice", voiceRoutes);
 
 
 // Health check route
