@@ -16,7 +16,7 @@ const port = process.env.PORT || 5056;
 const app = express();
 
 const allowedOrigins = [
-  'https://iotfiy-ecosystem.vercel.app',
+  'https://iotfiy-virtual-asistant.vercel.app',
   'http://localhost:5173',
 ];
 
