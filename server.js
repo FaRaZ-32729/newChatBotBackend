@@ -6,6 +6,7 @@ const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const path = require('path');
 const { initSocketServer } = require('./src/socket');
+const { corsOriginDelegate, getAllowedOrigins } = require('./src/utils/corsOrigins');
 
 const centeralRoutes = require('./src/routes/centeralRoutes');
 
@@ -15,20 +16,11 @@ dbConnection();
 const port = process.env.PORT || 5056;
 const app = express();
 
-const allowedOrigins = [
-  'https://iotfiy-virtual-asistant.vercel.app',
-  'http://localhost:5173',
-];
+// Required behind Hostinger / Nginx so Secure cookies work over HTTPS
+app.set('trust proxy', 1);
 
 app.use(cors({
-  origin(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: corsOriginDelegate,
   credentials: true,
 }));
 
@@ -43,4 +35,5 @@ initSocketServer(httpServer);
 
 httpServer.listen(port, () => {
   console.log(`Express + Socket.IO running on port ${port}`);
+  console.log(`[cors] Allowed origins: ${getAllowedOrigins().join(', ')}`);
 });

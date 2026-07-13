@@ -1,7 +1,8 @@
 const UserModel = require('../models/userModel');
 const sendEmail = require('../utils/emailService');
 const jwt = require('jsonwebtoken');
-const bcrypt = require("bcryptjs")
+const bcrypt = require("bcryptjs");
+const { getAuthCookieOptions, getClearAuthCookieOptions } = require('../utils/authCookie');
 
 // Helper: Generate JWT Token
 const generateToken = (user) => {
@@ -507,13 +508,8 @@ const login = async (req, res) => {
 
         const token = generateToken(user);
 
-        // Set httpOnly cookie
-        res.cookie('token', token, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production', // Use secure in production
-            sameSite: 'strict',
-            maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
-        });
+        // httpOnly cookie — SameSite=None + Secure when frontend is on another domain (Vercel)
+        res.cookie('token', token, getAuthCookieOptions());
 
         res.status(200).json({
             success: true,
@@ -537,13 +533,8 @@ const login = async (req, res) => {
 
 // logout user 
 const logout = async (req, res) => {
-    try {;
-        res.clearCookie('token', {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: 'strict',
-            path: '/',
-        });
+    try {
+        res.clearCookie('token', getClearAuthCookieOptions());
         res.status(200).json({ success: true, message: "Logged out successfully" });
     } catch (error) {
         console.error("Error in logout:", error);

@@ -5,13 +5,10 @@ const { Server } = require('socket.io');
 const { authenticateSocket } = require('./socketAuth');
 const { registerVoiceSocketHandlers } = require('./voiceSocketHandler');
 const { registerLiveSocketHandlers } = require('./liveSocketHandler');
-
-const allowedOrigins = [
-  'https://iotfiy-ecosystem.vercel.app',
-  'http://localhost:5173',
-];
+const { getAllowedOrigins } = require('../utils/corsOrigins');
 
 function initSocketServer(httpServer) {
+  const allowedOrigins = getAllowedOrigins();
   const io = new Server(httpServer, {
     cors: {
       origin: allowedOrigins,
