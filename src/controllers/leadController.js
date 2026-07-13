@@ -1,8 +1,9 @@
 /**
- * Lead capture controller — public kiosk submit with validation.
+ * Lead capture controller — public create + authenticated list by chatbot.
  */
 const mongoose = require('mongoose');
-const { saveLead } = require('../llm/services/leadService');
+const ChatbotModel = require('../models/chatbotModel');
+const { saveLead, getLeadsByChatbotId } = require('../llm/services/leadService');
 
 function clean(value) {
   return String(value || '').trim();
@@ -52,6 +53,44 @@ function validateLeadPayload(body) {
   };
 }
 
+function canAccessChatbot(user, chatbot) {
+  const ownerId = chatbot.createdBy?.toString?.() || String(chatbot.createdBy);
+  const userId = user._id.toString();
+  const isOwner = ownerId === userId;
+  const isTeamMember =
+    user.role === 'user' && user.createdBy?.toString() === ownerId;
+  const isAdmin = user.role === 'admin';
+  return isOwner || isTeamMember || isAdmin;
+}
+
+function topicCountsToObject(topicCounts) {
+  if (!topicCounts) return {};
+  if (topicCounts instanceof Map) {
+    return Object.fromEntries(topicCounts);
+  }
+  if (typeof topicCounts === 'object') {
+    // Mongoose Map lean() can be plain object
+    return { ...topicCounts };
+  }
+  return {};
+}
+
+function serializeLead(lead) {
+  return {
+    id: lead._id,
+    name: lead.name || '',
+    company: lead.company || '',
+    designation: lead.designation || '',
+    phone: lead.phone || '',
+    email: lead.email || '',
+    chatbotId: lead.chatbotId,
+    sessionId: lead.sessionId || '',
+    topic_counts: topicCountsToObject(lead.topic_counts),
+    createdAt: lead.createdAt,
+    updatedAt: lead.updatedAt,
+  };
+}
+
 async function createLead(req, res) {
   try {
     const { errors, data } = validateLeadPayload(req.body || {});
@@ -86,7 +125,57 @@ async function createLead(req, res) {
   }
 }
 
+/**
+ * GET /api/leads/chatbot/:chatbotId
+ * Returns only leads for that chatbot (auth + ownership required).
+ */
+async function getLeadsByChatbot(req, res) {
+  try {
+    const { chatbotId } = req.params;
+
+    if (!chatbotId || !mongoose.Types.ObjectId.isValid(chatbotId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid chatbotId is required',
+      });
+    }
+
+    const chatbot = await ChatbotModel.findById(chatbotId).select('name createdBy isActive');
+    if (!chatbot) {
+      return res.status(404).json({ success: false, message: 'Chatbot not found' });
+    }
+
+    if (!canAccessChatbot(req.user, chatbot)) {
+      return res.status(403).json({
+        success: false,
+        message: 'You can only view leads for your team chatbots',
+      });
+    }
+
+    const leads = await getLeadsByChatbotId(chatbotId);
+
+    return res.status(200).json({
+      success: true,
+      count: leads.length,
+      data: {
+        chatbot: {
+          id: chatbot._id,
+          name: chatbot.name,
+        },
+        leads: leads.map(serializeLead),
+      },
+    });
+  } catch (err) {
+    console.error('[lead] list by chatbot error:', err.message);
+    return res.status(500).json({
+      success: false,
+      message: err.message || 'Failed to fetch leads',
+    });
+  }
+}
+
 module.exports = {
   createLead,
+  getLeadsByChatbot,
   validateLeadPayload,
 };

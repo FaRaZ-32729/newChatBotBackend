@@ -10,13 +10,14 @@ const ensureDir = (dirPath) => {
 
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
-        const chatbotName = req.body.name ? req.body.name.replace(/[^a-zA-Z0-9]/g, '_') : 'default';
+        // Prefer explicit folder (update flow); else use name from body (create flow)
+        const chatbotName = req.uploadFolderName
+            || (req.body.name ? req.body.name.replace(/[^a-zA-Z0-9]/g, '_') : 'default');
         const uploadPath = path.join(__dirname, '../../uploads/chatbots', chatbotName);
         ensureDir(uploadPath);
         cb(null, uploadPath);
     },
     filename: function (req, file, cb) {
-        // Keep original name but add timestamp to avoid conflicts
         const originalName = file.originalname.replace(/\s+/g, '_');
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
         const ext = path.extname(originalName);
@@ -42,7 +43,7 @@ const fileFilter = (req, file, cb) => {
 const upload = multer({
     storage: storage,
     fileFilter: fileFilter,
-    limits: { fileSize: 100 * 1024 * 1024 } 
+    limits: { fileSize: 100 * 1024 * 1024 }
 });
 
 module.exports = { upload, ensureDir };

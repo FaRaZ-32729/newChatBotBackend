@@ -31,4 +31,10 @@ async function saveLead({
   return lead;
 }
 
-module.exports = { saveLead };
+async function getLeadsByChatbotId(chatbotId) {
+  return LeadModel.find({ chatbotId })
+    .sort({ createdAt: -1 })
+    .lean();
+}
+
+module.exports = { saveLead, getLeadsByChatbotId };

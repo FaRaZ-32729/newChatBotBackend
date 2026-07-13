@@ -1,12 +1,13 @@
 /**
  * MQTT publisher for speaker / webcam angle tracking.
- * Topic is project-specific (not the old home/speaker/angle).
+ * Each chatbot publishes to its own topic so devices can subscribe per bot:
+ *   {prefix}/{chatbotId}/speaker/angle
+ * Default: iotfiy/chatbot/<chatbotId>/speaker/angle
  */
 const mqtt = require('mqtt');
 
 const MQTT_CONFIG = {
   brokerUrl: process.env.MQTT_BROKER_URL || 'mqtt://localhost:1883',
-  topic: process.env.MQTT_TOPIC || 'iotfiy/chatbot/speaker/angle',
   options: {
     clientId: `iotfiy-chatbot-angle-${Math.random().toString(16).slice(2, 10)}`,
     reconnectPeriod: 5000,
@@ -18,6 +19,32 @@ const MQTT_CONFIG = {
 
 let client = null;
 let isConnected = false;
+
+/** Sanitize Mongo ObjectId / any id for safe MQTT topic segment. */
+function sanitizeChatbotId(chatbotId) {
+  const id = String(chatbotId || '').trim();
+  if (!/^[a-fA-F0-9]{24}$/.test(id) && !/^[a-zA-Z0-9_-]{3,64}$/.test(id)) {
+    return '';
+  }
+  return id;
+}
+
+/**
+ * Topic per chatbot.
+ * MQTT_TOPIC_PREFIX=iotfiy/chatbot  →  iotfiy/chatbot/<id>/speaker/angle
+ * Legacy MQTT_TOPIC=iotfiy/chatbot/speaker/angle is treated as prefix iotfiy/chatbot.
+ */
+function buildAngleTopic(chatbotId) {
+  const id = sanitizeChatbotId(chatbotId);
+  let prefix = String(process.env.MQTT_TOPIC_PREFIX || '').trim().replace(/\/+$/, '');
+
+  if (!prefix) {
+    const legacy = String(process.env.MQTT_TOPIC || 'iotfiy/chatbot').trim();
+    prefix = legacy.replace(/\/speaker\/angle\/?$/i, '').replace(/\/+$/, '') || 'iotfiy/chatbot';
+  }
+
+  return `${prefix}/${id}/speaker/angle`;
+}
 
 function connectMQTT() {
   if (client) return;
@@ -33,7 +60,7 @@ function connectMQTT() {
   client.on('connect', () => {
     isConnected = true;
     console.log('✅ Backend MQTT Connected Successfully!');
-    console.log(`📡 Topic: ${MQTT_CONFIG.topic}`);
+    console.log('📡 Angle topics: {prefix}/{chatbotId}/speaker/angle');
   });
 
   client.on('error', (err) => {
@@ -56,49 +83,63 @@ function connectMQTT() {
 }
 
 /**
- * Publish speaker angle to MQTT.
+ * Publish speaker angle for one chatbot.
  * @param {number} angle
- * @returns {boolean}
+ * @param {string} chatbotId - MongoDB _id of the chatbot (device registers this id)
+ * @returns {{ ok: boolean, topic?: string, chatbotId?: string, reason?: string }}
  */
-function sendAngle(angle) {
+function sendAngle(angle, chatbotId) {
   if (!client) connectMQTT();
 
-  if (!client || !isConnected) {
-    console.warn('⚠️ MQTT not connected, angle skipped:', angle);
-    return false;
+  const id = sanitizeChatbotId(chatbotId);
+  if (!id) {
+    console.warn('⚠️ MQTT angle skipped — missing/invalid chatbotId');
+    return { ok: false, reason: 'invalid_chatbotId' };
   }
 
+  if (!client || !isConnected) {
+    console.warn('⚠️ MQTT not connected, angle skipped:', angle, 'bot:', id);
+    return { ok: false, reason: 'mqtt_offline', chatbotId: id };
+  }
+
+  const topic = buildAngleTopic(id);
   const numeric = parseFloat(Number(angle).toFixed(1));
   const payload = {
+    chatbotId: id,
     angle: numeric,
     timestamp: Date.now(),
     source: 'webcam-speaker-angle',
   };
 
-  client.publish(MQTT_CONFIG.topic, JSON.stringify(payload), { qos: 1 }, (err) => {
+  client.publish(topic, JSON.stringify(payload), { qos: 1 }, (err) => {
     if (!err) {
-      console.log(`📤 [Backend] Angle Sent: ${numeric}° → ${MQTT_CONFIG.topic}`);
+      console.log(`📤 [Backend] Angle ${numeric}° → ${topic}`);
     } else {
       console.error('❌ Publish failed:', err.message);
     }
   });
 
-  return true;
+  return { ok: true, topic, chatbotId: id };
 }
 
-function getMqttStatus() {
+function getMqttStatus(chatbotId) {
+  const id = sanitizeChatbotId(chatbotId);
   return {
     connected: isConnected,
     brokerUrl: MQTT_CONFIG.brokerUrl,
-    topic: MQTT_CONFIG.topic,
+    topicExample: id
+      ? buildAngleTopic(id)
+      : 'iotfiy/chatbot/{chatbotId}/speaker/angle',
+    chatbotId: id || null,
   };
 }
 
-// Connect on module load
 connectMQTT();
 
 module.exports = {
   sendAngle,
   connectMQTT,
   getMqttStatus,
+  buildAngleTopic,
+  sanitizeChatbotId,
 };

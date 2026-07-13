@@ -269,6 +269,325 @@ const getChatbotsByUser = async (req, res) => {
     }
 };
 
+// ====================== UPDATE CHATBOT ======================
+/**
+ * Partial update. Only sent fields change.
+ * PDFs: send retainedPdfUrls (JSON array of existing urls to KEEP).
+ * Any existing PDF not listed is removed AFTER successful save (DB + disk + images).
+ * New PDFs: knowledgeBasePdfs files — same extract flow as create.
+ * On any error before successful DB save: leave chatbot exactly as before; delete only new uploads.
+ */
+function userHasAccess(accessList, key) {
+    const list = Array.isArray(accessList) ? accessList : [];
+    const want = String(key).toLowerCase();
+    return list.some((a) => String(a).toLowerCase() === want);
+}
+
+function normalizeUploadUrl(url) {
+    const raw = String(url || '').trim();
+    if (!raw) return '';
+    try {
+        if (raw.startsWith('http://') || raw.startsWith('https://')) {
+            const u = new URL(raw);
+            return u.pathname;
+        }
+    } catch {
+        /* ignore */
+    }
+    return raw.startsWith('/') ? raw : `/${raw}`;
+}
+
+function resolveUploadFsPath(urlPath) {
+    const normalized = normalizeUploadUrl(urlPath).replace(/^\//, '');
+    return path.join(__dirname, '../..', normalized);
+}
+
+function getChatbotFolderName(chatbot) {
+    const fromUrl = normalizeUploadUrl(chatbot.onboardingImage || chatbot.knowledgeBasePdfs?.[0]?.url || '');
+    const match = fromUrl.match(/\/uploads\/chatbots\/([^/]+)\//);
+    if (match?.[1]) return match[1];
+    return String(chatbot.name || 'default').replace(/[^a-zA-Z0-9]/g, '_');
+}
+
+function pdfImagesDir(folderName, pdfOriginalName) {
+    const pdfNameClean = String(pdfOriginalName || '')
+        .replace(/\.pdf$/i, '')
+        .replace(/[^a-zA-Z0-9]/g, '_');
+    return path.join(__dirname, '../../uploads/chatbots', folderName, pdfNameClean);
+}
+
+function removePdfArtifactsFromDisk(pdfEntry, folderName) {
+    try {
+        if (pdfEntry?.url) {
+            const pdfPath = resolveUploadFsPath(pdfEntry.url);
+            if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
+        }
+    } catch (e) {
+        console.error('Failed to remove PDF file:', pdfEntry?.url, e.message);
+    }
+
+    try {
+        const imgDir = pdfImagesDir(folderName, pdfEntry?.name);
+        if (fs.existsSync(imgDir)) {
+            fs.rmSync(imgDir, { recursive: true, force: true });
+        }
+    } catch (e) {
+        console.error('Failed to remove PDF images folder:', pdfEntry?.name, e.message);
+    }
+}
+
+function canManageChatbot(user, chatbot) {
+    const ownerId = chatbot.createdBy.toString();
+    const isOwner = ownerId === user._id.toString();
+    const isTeamMember =
+        user.role === 'user' && user.createdBy?.toString() === ownerId;
+    const isAdmin = user.role === 'admin';
+    return isOwner || isTeamMember || isAdmin;
+}
+
+const updateChatbot = async (req, res) => {
+    const { id } = req.params;
+    const currentUser = req.user;
+
+    let chatbot;
+    try {
+        chatbot = await ChatbotModel.findById(id);
+    } catch (error) {
+        return res.status(400).json({ success: false, message: 'Invalid chatbot id' });
+    }
+
+    if (!chatbot) {
+        return res.status(404).json({ success: false, message: 'Chatbot not found' });
+    }
+
+    if (!canManageChatbot(currentUser, chatbot)) {
+        return res.status(403).json({
+            success: false,
+            message: 'You can only update your team chatbots',
+        });
+    }
+
+    const folderName = getChatbotFolderName(chatbot);
+    req.uploadFolderName = folderName;
+
+    // Track only NEW artifacts for rollback (never touch existing until DB save succeeds)
+    const newUploadFiles = [];
+    const newImageFolders = [];
+
+    uploadAny(req, res, async (err) => {
+        try {
+            if (err) {
+                console.error('Multer Error (update):', err);
+                return res.status(400).json({ success: false, message: err.message });
+            }
+
+            const files = req.files || [];
+            newUploadFiles.push(...files);
+
+            const body = req.body || {};
+            const hasHead = userHasAccess(currentUser.access, 'head movement');
+            const hasHand = userHasAccess(currentUser.access, 'hand movement');
+
+            // --- Parse retained PDF urls (keep list). If omitted, keep all existing. ---
+            let retainedPdfUrls = null;
+            if (body.retainedPdfUrls !== undefined && body.retainedPdfUrls !== '') {
+                try {
+                    retainedPdfUrls = typeof body.retainedPdfUrls === 'string'
+                        ? JSON.parse(body.retainedPdfUrls)
+                        : body.retainedPdfUrls;
+                    if (!Array.isArray(retainedPdfUrls)) {
+                        throw new Error('retainedPdfUrls must be an array');
+                    }
+                    retainedPdfUrls = retainedPdfUrls.map(normalizeUploadUrl).filter(Boolean);
+                } catch (parseErr) {
+                    cleanupChatbotUploads([], newUploadFiles);
+                    return res.status(400).json({
+                        success: false,
+                        message: 'retainedPdfUrls must be a JSON array of PDF urls to keep',
+                    });
+                }
+            }
+
+            const existingPdfs = Array.isArray(chatbot.knowledgeBasePdfs)
+                ? chatbot.knowledgeBasePdfs.map((p) => p.toObject?.() || p)
+                : [];
+
+            const retainedSet = retainedPdfUrls
+                ? new Set(retainedPdfUrls)
+                : new Set(existingPdfs.map((p) => normalizeUploadUrl(p.url)));
+
+            const keptPdfs = existingPdfs.filter((p) => retainedSet.has(normalizeUploadUrl(p.url)));
+            const removedPdfs = existingPdfs.filter((p) => !retainedSet.has(normalizeUploadUrl(p.url)));
+
+            // --- Process NEW PDFs (create-style extraction) ---
+            const newPdfFiles = files.filter((f) => f.fieldname === 'knowledgeBasePdfs');
+            const addedPdfs = [];
+
+            for (const pdfFile of newPdfFiles) {
+                const pdfNameClean = pdfFile.originalname
+                    .replace(/\.pdf$/i, '')
+                    .replace(/[^a-zA-Z0-9]/g, '_');
+                const imagesFolder = pdfImagesDir(folderName, pdfFile.originalname);
+                newImageFolders.push(imagesFolder);
+
+                const extractedImages = await processPDFImages(
+                    pdfFile.path,
+                    folderName,
+                    pdfNameClean
+                );
+
+                addedPdfs.push({
+                    name: pdfFile.originalname,
+                    url: `/uploads/chatbots/${folderName}/${pdfFile.filename}`,
+                    size: `${(pdfFile.size / (1024 * 1024)).toFixed(2)} MB`,
+                    extractedImages,
+                });
+            }
+
+            const nextPdfs = [...keptPdfs, ...addedPdfs];
+            if (nextPdfs.length === 0) {
+                cleanupChatbotUploads(newImageFolders, newUploadFiles);
+                return res.status(400).json({
+                    success: false,
+                    message: 'At least one knowledge base PDF is required',
+                });
+            }
+
+            // --- Optional field updates (only if provided) ---
+            const nextName = body.name !== undefined ? String(body.name).trim() : chatbot.name;
+            const nextActivationKey = body.activationKey !== undefined
+                ? String(body.activationKey).toLowerCase().trim()
+                : chatbot.activationKey;
+            const nextInstructions = body.specificInstructions !== undefined
+                ? String(body.specificInstructions).trim()
+                : chatbot.specificInstructions;
+
+            if (!nextName || !nextActivationKey || !nextInstructions) {
+                cleanupChatbotUploads(newImageFolders, newUploadFiles);
+                return res.status(400).json({
+                    success: false,
+                    message: 'Name, Activation Key and Instructions are required',
+                });
+            }
+
+            // Unique name within owner pool (exclude self)
+            if (nextName !== chatbot.name) {
+                const ownerId = chatbot.createdBy;
+                const clash = await ChatbotModel.findOne({
+                    name: nextName,
+                    createdBy: ownerId,
+                    _id: { $ne: chatbot._id },
+                });
+                if (clash) {
+                    cleanupChatbotUploads(newImageFolders, newUploadFiles);
+                    return res.status(409).json({
+                        success: false,
+                        message: 'A chatbot with this name already exists for your team. Please choose a different name.',
+                    });
+                }
+            }
+
+            let nextScanCard = chatbot.scanCardRequired;
+            if (body.scanCardRequired !== undefined) {
+                nextScanCard = body.scanCardRequired === 'true' || body.scanCardRequired === true;
+            }
+
+            let nextHead = chatbot.headMovementMode;
+            if (hasHead && body.headMovementMode !== undefined) {
+                nextHead = body.headMovementMode || null;
+            } else if (!hasHead) {
+                nextHead = chatbot.headMovementMode;
+            }
+
+            let nextHand = chatbot.handMovements;
+            if (hasHand && body.handMovements !== undefined) {
+                let parsed = body.handMovements;
+                if (typeof parsed === 'string') {
+                    try {
+                        parsed = JSON.parse(parsed);
+                    } catch {
+                        parsed = null;
+                    }
+                }
+                nextHand = parsed;
+            }
+
+            const onboardingFile = files.find((f) => f.fieldname === 'onboardingImage');
+            let nextOnboarding = chatbot.onboardingImage;
+            let oldOnboardingToDelete = null;
+            if (onboardingFile) {
+                nextOnboarding = `/uploads/chatbots/${folderName}/${onboardingFile.filename}`;
+                oldOnboardingToDelete = chatbot.onboardingImage;
+            }
+
+            const pdfsChanged = removedPdfs.length > 0 || addedPdfs.length > 0;
+
+            // Apply updates in memory then save — if save fails, nothing persisted
+            chatbot.name = nextName;
+            chatbot.activationKey = nextActivationKey;
+            chatbot.specificInstructions = nextInstructions;
+            chatbot.scanCardRequired = nextScanCard;
+            chatbot.headMovementMode = nextHead;
+            chatbot.handMovements = nextHand;
+            chatbot.onboardingImage = nextOnboarding;
+            chatbot.knowledgeBasePdfs = nextPdfs;
+
+            if (pdfsChanged) {
+                chatbot.knowledgeTextCache = '';
+                chatbot.knowledgeCachedAt = undefined;
+            }
+
+            const saved = await chatbot.save();
+
+            // DB saved — now safe to delete removed PDF files / old avatar from disk
+            for (const pdf of removedPdfs) {
+                removePdfArtifactsFromDisk(pdf, folderName);
+            }
+            if (oldOnboardingToDelete && oldOnboardingToDelete !== nextOnboarding) {
+                try {
+                    const oldPath = resolveUploadFsPath(oldOnboardingToDelete);
+                    if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+                } catch (e) {
+                    console.error('Failed to remove old onboarding image:', e.message);
+                }
+            }
+
+            if (pdfsChanged) {
+                setImmediate(async () => {
+                    try {
+                        const { getChatbotKnowledge } = require('../llm/services/knowledgeService');
+                        await getChatbotKnowledge(saved);
+                    } catch (cacheErr) {
+                        console.error('[chatbot] knowledge cache rebuild failed:', cacheErr.message);
+                    }
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                message: 'Chatbot updated successfully!',
+                data: saved,
+            });
+        } catch (error) {
+            console.error('Update Chatbot Error:', error);
+
+            // Rollback new uploads only — existing DB + files untouched
+            cleanupChatbotUploads(newImageFolders, newUploadFiles);
+
+            // Reload original doc state is automatic since we never saved on failure
+            // (if save() partially ran it would throw before commit — mongoose save is atomic per doc)
+
+            const message = error.message || 'Failed to update chatbot. No changes were applied.';
+            const status = /extraction failed/i.test(message) ? 422 : 500;
+
+            return res.status(status).json({
+                success: false,
+                message,
+            });
+        }
+    });
+};
+
 // ====================== GET PUBLIC CHATBOT (shareable URL) ======================
 // No login required — used when opening /chatbot/:id link
 const getPublicChatbot = async (req, res) => {
@@ -297,6 +616,7 @@ const getPublicChatbot = async (req, res) => {
 
 module.exports = {
     createChatbot,
+    updateChatbot,
     deleteChatbot,
     getChatbotsByUser,
     getPublicChatbot,
