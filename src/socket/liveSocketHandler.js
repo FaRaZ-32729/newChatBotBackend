@@ -3,18 +3,21 @@
  */
 const { loadChatbotForVoice } = require('../llm/services/voiceTurnService');
 const { getChatbotKnowledge } = require('../llm/services/knowledgeService');
-const { extractCardFromImage } = require('../llm/services/cardScanService');
+const { extractCardFromBase64 } = require('../services/cardScanService');
 const {
   startGeminiLiveForSocket,
   sendLiveAudio,
   sendLiveText,
   endLiveAudioStream,
   handleUserSpeechEnd,
+  handleWakeAttempt,
   stopGeminiLiveForSocket,
   mergeLeadDraft,
+  emitLeadForm,
   getSessionEntry,
   setMicEnabled,
   interruptLiveSession,
+  endLiveConversation,
 } = require('../llm/live/geminiLiveBridge');
 
 function registerLiveSocketHandlers(io) {
@@ -33,7 +36,10 @@ function registerLiveSocketHandlers(io) {
           return ack?.({ success: false, message: error.message });
         }
 
-        console.log(`[live] Starting for bot "${chatbot.name}" (${chatbotId})`);
+        console.log(
+          `[live] Starting for bot "${chatbot.name}" (${chatbotId}) `
+          + `| activationKey="${chatbot.activationKey || ''}"`
+        );
         const knowledgeText = await getChatbotKnowledge(chatbot);
         const { model } = await startGeminiLiveForSocket(socket, chatbot, knowledgeText);
 
@@ -76,6 +82,10 @@ function registerLiveSocketHandlers(io) {
       handleUserSpeechEnd(socket.id);
     });
 
+    socket.on('live:wake', () => {
+      handleWakeAttempt(socket.id);
+    });
+
     socket.on('live:text', (payload) => {
       const { text } = payload || {};
       if (!text?.trim()) return;
@@ -92,6 +102,7 @@ function registerLiveSocketHandlers(io) {
       sendLiveText(socket.id, '[INACTIVITY_CHECK]');
     });
 
+    /** Prefer REST /api/card-scan from frontend; Mindee fallback via socket */
     socket.on('live:card_scan', async (payload, ack) => {
       try {
         const { imageBase64, mimeType } = payload || {};
@@ -99,22 +110,41 @@ function registerLiveSocketHandlers(io) {
           return ack?.({ success: false, message: 'imageBase64 is required' });
         }
 
-        console.log('[live] Scanning visiting card…');
-        const extracted = await extractCardFromImage(imageBase64, mimeType || 'image/jpeg');
+        console.log('[live] Scanning visiting card via Mindee…');
+        const extracted = await extractCardFromBase64(
+          imageBase64,
+          mimeType || 'image/jpeg'
+        );
+
+        if (extracted.noData) {
+          return ack?.({
+            success: false,
+            message: extracted.displayText || 'No data extracted. Try a clearer photo.',
+            data: extracted,
+          });
+        }
+
+        const lead = {
+          name: extracted.name || '',
+          company: extracted.company || '',
+          designation: extracted.designation || '',
+          phone: extracted.phone || '',
+          email: extracted.email || '',
+        };
+
+        const entry = getSessionEntry(socket.id);
+        if (entry?.meta) {
+          emitLeadForm(entry.meta, lead, { editable: true });
+        }
 
         const cardMessage = `[CARD_SCANNED]
-Raw Text: ${extracted.rawText}
-Extracted Data: ${JSON.stringify({
-          name: extracted.name,
-          company: extracted.company,
-          designation: extracted.designation,
-          phone: extracted.phone,
-          email: extracted.email,
-        })}`;
+Raw Text: ${extracted.rawText || extracted.displayText || ''}
+Extracted Data: ${JSON.stringify(lead)}
+Form is on screen. Read the details aloud and ask the visitor to confirm. On YES call submitLead.`;
 
         sendLiveText(socket.id, cardMessage);
 
-        ack?.({ success: true, data: extracted });
+        ack?.({ success: true, data: { ...extracted, ...lead } });
       } catch (err) {
         console.error('[live] card scan error:', err.message);
         ack?.({ success: false, message: err.message || 'Card scan failed' });
@@ -123,6 +153,10 @@ Extracted Data: ${JSON.stringify({
 
     socket.on('live:interrupt', () => {
       interruptLiveSession(socket.id);
+    });
+
+    socket.on('live:end_chat', () => {
+      endLiveConversation(socket.id);
     });
 
     socket.on('live:stop', async (payload, ack) => {

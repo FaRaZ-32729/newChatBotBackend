@@ -274,7 +274,7 @@ const getChatbotsByUser = async (req, res) => {
 const getPublicChatbot = async (req, res) => {
     try {
         const { id } = req.params;
-        const chatbot = await ChatbotModel.findById(id).select('name onboardingImage isActive');
+        const chatbot = await ChatbotModel.findById(id).select('name onboardingImage isActive activationKey');
 
         if (!chatbot || chatbot.isActive === false) {
             return res.status(404).json({ success: false, message: 'Chatbot not found or inactive' });
@@ -286,6 +286,7 @@ const getPublicChatbot = async (req, res) => {
                 _id: chatbot._id,
                 name: chatbot.name,
                 onboardingImage: chatbot.onboardingImage,
+                activationKey: chatbot.activationKey || '',
             },
         });
     } catch (error) {

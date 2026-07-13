@@ -11,7 +11,11 @@ const { saveLead } = require('../services/leadService');
 const {
   buildNumberedImageCatalog,
   resolveSlideshowForTopicKey,
+  findCatalogImageById,
   formatImageForFrontend,
+  scoreImageAgainstSpeech,
+  pickBestImageForSpeech,
+  pickClusterForSpeech,
 } = require('./chatbotImageService');
 const {
   isNoiseTranscript,
@@ -54,17 +58,33 @@ function createSessionMeta(socket, chatbot) {
     catalog,
     topics,
     currentSlideshow: [],
+    fullPdfPool: [],
+    pendingSlideshow: null,
+    pendingPdfName: null,
+    pendingPdfKey: null,
+    slideshowEmittedKey: null,
     assistantBuffer: '',
+    spokenTurnText: '',
+    imageShownThisTurn: false,
+    lastShownImageId: null,
+    lastSpeechSyncLen: 0,
+    deferredShowImageIds: [],
     topicDispatchedThisTurn: false,
     leadDraft: { name: '', company: '', designation: '', phone: '', email: '' },
     leadFormShown: false,
     topicCounts: {},
     isActivated: false,
+    activatedAt: 0,
+    wakePending: false,
+    ignoreWakeUntil: 0,
+    suppressOutput: false,
     micEnabled: false,
     userUtteranceBuffer: '',
     userStreamBuffer: '',
     greetNudgeSent: false,
     lastSpeechEndAt: 0,
+    wakeActivationTimer: null,
+    wakeAudioEndTimer: null,
     setupDone: false,
     geminiSession: null,
     model: null,
@@ -89,86 +109,290 @@ function extractLeadDetails(text) {
   if (phones.length) details.phone = phones.join(', ');
 
   const nameMatch = source.match(
-    /\b(?:my\s+name\s+is|name\s+is|i\s+am|i'm|this\s+is)\s+([A-Za-z][A-Za-z .'-]{1,60})(?=\s+(?:and|phone|number|email|from|in)\b|[,.;]|$)/i
+    /\b(?:my\s+name\s+is|name\s+is|i\s+am|i'm|this\s+is|mera\s+naam|mera\s+name)\s*(?:hai\s*)?[:\-]?\s*([A-Za-z\u0600-\u06FF][A-Za-z\u0600-\u06FF .'-]{1,60})(?=\s+(?:and|aur|phone|number|email|from|in|company|designation)\b|[,.;]|$)/i
   );
   if (nameMatch) details.name = cleanLeadValue(nameMatch[1]);
 
+  // "mera naam Faraz hai" / bot read-back "naam Faraz,"
+  if (!details.name) {
+    const altName = source.match(
+      /\b(?:naam|name)\s+([A-Za-z\u0600-\u06FF][A-Za-z\u0600-\u06FF .']{1,40}?)(?=\s+hai\b|\s*,|\s+company|\s+designation|\s+phone|\s+email|\s+aur\b|$)/i
+    );
+    if (altName) details.name = cleanLeadValue(altName[1]);
+  }
+
   const companyMatch = source.match(
-    /\b(?:company\s+(?:name\s+)?is|company\s+is|i\s+work\s+(?:at|for))\s+([A-Za-z0-9][A-Za-z0-9 .&'()-]{1,80})(?=\s+(?:and|designation|phone|email)\b|[,.;]|$)/i
+    /\b(?:company\s+(?:name\s+)?is|company\s+is|i\s+work\s+(?:at|for)|meri\s+company)\s*(?:hai\s*)?[:\-]?\s*([A-Za-z0-9\u0600-\u06FF][A-Za-z0-9\u0600-\u06FF .&'()-]{1,80})(?=\s+(?:and|aur|designation|phone|email)\b|[,.;]|$)/i
   );
   if (companyMatch) details.company = cleanLeadValue(companyMatch[1]);
 
+  if (!details.company) {
+    const altCo = source.match(
+      /\bcompany\s+([A-Za-z0-9\u0600-\u06FF][A-Za-z0-9\u0600-\u06FF .&'-]{0,60}?)(?=\s*,|\s+designation|\s+phone|\s+email|\s+aur\b|$)/i
+    );
+    if (altCo) details.company = cleanLeadValue(altCo[1]);
+  }
+
   const designationMatch = source.match(
-    /\b(?:designation\s+is|job\s+title\s+is|title\s+is|role\s+is)\s+([A-Za-z][A-Za-z .&'/-]{1,60})(?=\s+(?:and|phone|email)\b|[,.;]|$)/i
+    /\b(?:designation\s+is|job\s+title\s+is|title\s+is|role\s+is|mera\s+designation)\s*(?:hai\s*)?[:\-]?\s*([A-Za-z\u0600-\u06FF][A-Za-z\u0600-\u06FF .&'/-]{1,60})(?=\s+(?:and|aur|phone|email)\b|[,.;]|$)/i
   );
   if (designationMatch) details.designation = cleanLeadValue(designationMatch[1]);
+
+  if (!details.designation) {
+    const altDes = source.match(
+      /\bdesignation\s+([A-Za-z\u0600-\u06FF][A-Za-z\u0600-\u06FF .&'/-]{0,40}?)(?=\s*,|\s+phone|\s+email|\s+aur\b|$)/i
+    );
+    if (altDes) details.designation = cleanLeadValue(altDes[1]);
+  }
 
   return details;
 }
 
+function leadLooksReady(draft) {
+  const d = draft || {};
+  const name = String(d.name || '').trim();
+  const phone = String(d.phone || '').trim();
+  const email = String(d.email || '').trim();
+  // Show once we have identity + at least one contact channel
+  return Boolean(name && (phone || email));
+}
+
 function mergeLeadDraft(meta, text, forceShow = false) {
   const extracted = extractLeadDetails(text);
-  if (!Object.keys(extracted).length) return;
+  if (!Object.keys(extracted).length && !forceShow) return;
 
-  meta.leadDraft = { ...meta.leadDraft, ...extracted };
+  if (Object.keys(extracted).length) {
+    meta.leadDraft = { ...meta.leadDraft, ...extracted };
+  }
 
   const d = meta.leadDraft;
-  const hasRequired = Boolean(d.name && d.phone && d.email);
-  if ((forceShow || hasRequired) && !meta.leadFormShown) {
+  if ((forceShow || leadLooksReady(d)) && !meta.leadFormShown) {
     meta.leadFormShown = true;
+    emitJson(meta.socket, { type: 'show_lead_form', data: { ...d } });
+    console.log('[live] Lead form shown', d);
+  } else if (meta.leadFormShown && Object.keys(extracted).length) {
+    // Keep form updated as more fields arrive
     emitJson(meta.socket, { type: 'show_lead_form', data: { ...d } });
   }
 }
 
+function emitLeadForm(meta, data, { editable = false } = {}) {
+  meta.leadFormShown = true;
+  meta.leadDraft = { ...meta.leadDraft, ...(data || {}) };
+  emitJson(meta.socket, {
+    type: 'show_lead_form',
+    data: { ...meta.leadDraft },
+    editable,
+  });
+  console.log('[live] Lead form emit', meta.leadDraft);
+}
+
+/**
+ * [[TOPIC: pdfKey]] from assistant response only.
+ * Prepares the image pool — does NOT flash wrong slides.
+ * Visible images appear when [[SHOW_IMAGE:N]] fires.
+ */
 function dispatchSlideshowForTopic(meta, topicKey) {
   const result = resolveSlideshowForTopicKey(meta.catalog, meta.topics, topicKey);
 
   if (!result.matched || !result.images.length) {
+    meta.pendingSlideshow = [];
+    meta.fullPdfPool = [];
     meta.currentSlideshow = [];
-    emitJson(meta.socket, {
-      type: 'show_onboarding',
-      topic: topicKey,
-      reason: 'general_or_unknown_topic',
-    });
-    console.log(`[live] LLM topic "${topicKey}" → onboarding image`);
+    meta.slideshowEmittedKey = null;
+    // Do not wipe UI while lead form is up (TOPIC General was hiding the form)
+    if (!meta.leadFormShown) {
+      emitJson(meta.socket, {
+        type: 'show_onboarding',
+        topic: topicKey,
+        reason: 'general_or_unknown_topic',
+      });
+    }
+    console.log(`[live] LLM topic "${topicKey}" → onboarding (no images)`);
     return;
   }
 
-  meta.currentSlideshow = result.images;
-  const images = result.images.map(formatImageForFrontend);
-
-  emitJson(meta.socket, {
-    type: 'images',
-    images,
-    pdfName: result.pdfName,
-    pdfKey: result.pdfKey,
-    replace: true,
-    holdCarouselMs: 5000,
-  });
-
-  console.log(`[live] LLM topic "${topicKey}" → ${images.length} image(s) from "${result.pdfName}"`);
+  meta.pendingSlideshow = result.images;
+  meta.fullPdfPool = result.images;
+  meta.pendingPdfName = result.pdfName;
+  meta.pendingPdfKey = result.pdfKey;
+  console.log(
+    `[live] LLM topic "${topicKey}" → prepared ${result.images.length} image(s) from "${result.pdfName}" (waiting for SHOW_IMAGE)`
+  );
 }
 
-function emitImageSync(meta, catalogImageId) {
-  const slideshow = meta.currentSlideshow || [];
-  let slideIndex = slideshow.findIndex((img) => img.id === catalogImageId);
-  if (slideIndex < 0 && catalogImageId >= 1 && catalogImageId <= slideshow.length) {
-    slideIndex = catalogImageId - 1;
+/**
+ * Show a related-section cluster for what the LLM is saying.
+ * 1 related image → single; many → carousel of that section only (not whole PDF).
+ */
+function emitImageSync(meta, catalogImageId, options = {}) {
+  const fromSpeech = Boolean(options.fromSpeech);
+  const recentSpeech = String(options.speechText || meta.spokenTurnText || '').trim();
+
+  let pdfPool = Array.isArray(meta.pendingSlideshow) && meta.pendingSlideshow.length
+    ? meta.pendingSlideshow
+    : Array.isArray(meta.fullPdfPool) && meta.fullPdfPool.length
+      ? meta.fullPdfPool
+      : Array.isArray(meta.currentSlideshow) && meta.currentSlideshow.length
+        ? meta.currentSlideshow
+        : [];
+
+  const preferred = findCatalogImageById(meta.catalog, catalogImageId);
+  if (preferred && (!pdfPool.length || !pdfPool.some((img) => img.pdfKey === preferred.pdfKey))) {
+    pdfPool = (meta.catalog || []).filter((img) => img.pdfKey === preferred.pdfKey);
+  }
+  if (!pdfPool.length && preferred) {
+    pdfPool = (meta.catalog || []).filter((img) => img.pdfKey === preferred.pdfKey);
+  }
+
+  const picked = pickClusterForSpeech(
+    pdfPool.length ? pdfPool : meta.catalog,
+    recentSpeech,
+    catalogImageId
+  );
+
+  const target = picked?.focus
+    || preferred
+    || findCatalogImageById(meta.catalog, catalogImageId);
+
+  if (!target) {
+    console.warn(`[live] SHOW_IMAGE:${catalogImageId} — not found in catalog`);
+    return;
+  }
+
+  const cluster = (picked?.cluster?.length ? picked.cluster : [target]);
+  if (Number(target.id) !== Number(catalogImageId) || fromSpeech) {
+    console.log(
+      `[live] IMAGE cluster ${cluster.length} slide(s) focus=${target.id} "${String(target.topic).slice(0, 50)}"${fromSpeech ? ' (speech)' : ''}`
+    );
+  }
+
+  meta.fullPdfPool = pdfPool.length
+    ? pdfPool
+    : (meta.catalog || []).filter((img) => img.pdfKey === target.pdfKey);
+
+  const slideIndex = Math.max(0, cluster.findIndex((img) => img.id === target.id));
+  const poolKey = `${target.pdfKey}:sec:${cluster.map((i) => i.id).join(',')}`;
+  const needEmitImages = meta.slideshowEmittedKey !== poolKey;
+
+  meta.currentSlideshow = cluster;
+  meta.pendingSlideshow = meta.fullPdfPool;
+  meta.pendingPdfKey = target.pdfKey;
+  meta.pendingPdfName = target.pdfName;
+  meta.imageShownThisTurn = true;
+  meta.lastShownImageId = target.id;
+
+  if (needEmitImages) {
+    meta.slideshowEmittedKey = poolKey;
+    emitJson(meta.socket, {
+      type: 'images',
+      images: cluster.map(formatImageForFrontend),
+      pdfName: target.pdfName,
+      pdfKey: target.pdfKey,
+      replace: true,
+      // Multi-image section → gentle carousel; single → no auto-advance needed
+      holdCarouselMs: cluster.length > 1 ? 4500 : 0,
+      autoAdvance: cluster.length > 1,
+      initialSlideIndex: slideIndex,
+    });
   }
 
   emitJson(meta.socket, {
     type: 'image_sync',
-    imageId: catalogImageId,
-    slideIndex: slideIndex >= 0 ? slideIndex : 0,
+    imageId: target.id,
+    slideIndex,
     timestamp: Date.now(),
   });
+
+  console.log(
+    `[live] SHOW → slide ${slideIndex + 1}/${cluster.length} id=${target.id} "${String(target.topic).slice(0, 55)}"`
+  );
+}
+
+/** Progressive sync: as LLM speaks, switch section cluster to match recent words. */
+function syncImagesFromRecentSpeech(meta, force = false) {
+  const spoken = String(meta.spokenTurnText || '').trim();
+  if (spoken.length < 20) return;
+
+  const sinceLast = spoken.length - (meta.lastSpeechSyncLen || 0);
+  if (!force && sinceLast < 22) return;
+  meta.lastSpeechSyncLen = spoken.length;
+
+  const recent = spoken.slice(-200);
+  const pdfPool = Array.isArray(meta.fullPdfPool) && meta.fullPdfPool.length
+    ? meta.fullPdfPool
+    : Array.isArray(meta.pendingSlideshow) && meta.pendingSlideshow.length
+      ? meta.pendingSlideshow
+      : Array.isArray(meta.currentSlideshow) && meta.currentSlideshow.length
+        ? meta.currentSlideshow
+        : [];
+
+  if (!pdfPool.length) return;
+
+  const picked = pickClusterForSpeech(pdfPool, recent, meta.lastShownImageId);
+  if (!picked?.focus) return;
+
+  const focusScore = scoreImageAgainstSpeech(picked.focus, recent);
+  if (focusScore < 2 && !force) return;
+
+  const newKey = `${picked.focus.pdfKey}:sec:${picked.cluster.map((i) => i.id).join(',')}`;
+  if (newKey === meta.slideshowEmittedKey && meta.lastShownImageId === picked.focus.id) {
+    return;
+  }
+
+  emitImageSync(meta, picked.focus.id, { fromSpeech: true, speechText: recent });
+}
+
+/** If model never emitted SHOW_IMAGE, pick best cluster from spoken answer. */
+function autoSyncImageFromSpeech(meta) {
+  if (meta.imageShownThisTurn) {
+    syncImagesFromRecentSpeech(meta, true);
+    return;
+  }
+  const spoken = String(meta.spokenTurnText || '').trim();
+  if (spoken.length < 24) return;
+
+  const pool = Array.isArray(meta.pendingSlideshow) && meta.pendingSlideshow.length
+    ? meta.pendingSlideshow
+    : Array.isArray(meta.fullPdfPool) && meta.fullPdfPool.length
+      ? meta.fullPdfPool
+      : Array.isArray(meta.currentSlideshow) && meta.currentSlideshow.length
+        ? meta.currentSlideshow
+        : [];
+
+  if (!pool.length) return;
+
+  const best = pickBestImageForSpeech(pool, spoken);
+  if (!best) return;
+
+  console.log(`[live] Auto image from speech → ${best.id} "${String(best.topic).slice(0, 50)}"`);
+  emitImageSync(meta, best.id, { fromSpeech: true, speechText: spoken });
+}
+
+/** Flush SHOW_IMAGE ids that arrived before enough spoken text existed. */
+function flushDeferredShowImages(meta, force = false) {
+  const queue = Array.isArray(meta.deferredShowImageIds) ? meta.deferredShowImageIds : [];
+  if (!queue.length) return;
+
+  const spokenLen = String(meta.spokenTurnText || '').trim().length;
+  if (!force && spokenLen < 28) return;
+
+  meta.deferredShowImageIds = [];
+  for (const imageId of queue) {
+    emitImageSync(meta, imageId);
+  }
+}
+
+/** After full answer text is known, fix a clearly wrong slide. */
+function revalidateShownImage(meta) {
+  syncImagesFromRecentSpeech(meta, true);
 }
 
 function parseAssistantMarkers(meta, chunkText) {
   meta.assistantBuffer += chunkText;
   let buffer = meta.assistantBuffer;
-  let imageId = null;
 
+  // Process TOPIC markers (may appear once per turn)
   const topicMatch = buffer.match(/\[\[TOPIC:\s*([^\]]+?)\]\]/i);
   if (topicMatch) {
     const topic = topicMatch[1].trim();
@@ -184,12 +408,17 @@ function parseAssistantMarkers(meta, chunkText) {
     }
   }
 
-  // Process every [[SHOW_IMAGE:N]] marker in order (sync slides as bot discusses each image)
+  // SHOW_IMAGE — defer briefly until we have spoken words (markers often arrive first)
   let imageMatch;
-  while ((imageMatch = buffer.match(/\[\[SHOW_IMAGE:(\d+)\]\]/))) {
-    imageId = parseInt(imageMatch[1], 10);
+  while ((imageMatch = buffer.match(/\[\[SHOW_IMAGE:(\d+)\]\]/i))) {
+    const imageId = parseInt(imageMatch[1], 10);
     buffer = buffer.replace(imageMatch[0], '');
-    emitImageSync(meta, imageId);
+    if (String(meta.spokenTurnText || '').trim().length < 28) {
+      if (!Array.isArray(meta.deferredShowImageIds)) meta.deferredShowImageIds = [];
+      meta.deferredShowImageIds.push(imageId);
+    } else {
+      emitImageSync(meta, imageId);
+    }
   }
 
   const leadFormMatch = buffer.match(/\[SHOW_LEAD_FORM(.*?)\]/i);
@@ -209,9 +438,8 @@ function parseAssistantMarkers(meta, chunkText) {
       meta.leadDraft = { ...meta.leadDraft, ...leadData };
     }
 
-    meta.leadFormShown = true;
     buffer = buffer.replace(leadFormMatch[0], '');
-    emitJson(meta.socket, { type: 'show_lead_form', data: leadData || { ...meta.leadDraft } });
+    emitLeadForm(meta, leadData || { ...meta.leadDraft });
   }
 
   const cameraMatch = buffer.match(/\[ACTIVATE_CAMERA\]/i);
@@ -224,12 +452,19 @@ function parseAssistantMarkers(meta, chunkText) {
   meta.assistantBuffer = buffer;
 
   const cleaned = chunkText
-    .replace(/\[\[SHOW_IMAGE:\d+\]\]/g, '')
+    .replace(/\[\[SHOW_IMAGE:\d+\]\]/gi, '')
     .replace(/\[\[TOPIC:\s*[^\]]+?\]\]/gi, '')
     .replace(/\[SHOW_LEAD_FORM.*?\]/gi, '')
     .replace(/\[ACTIVATE_CAMERA\]/gi, '');
 
-  return { cleaned, imageId };
+  const spokenBit = String(cleaned || '').replace(/\s+/g, ' ').trim();
+  if (spokenBit) {
+    meta.spokenTurnText = `${meta.spokenTurnText || ''} ${spokenBit}`.trim();
+    flushDeferredShowImages(meta, false);
+    syncImagesFromRecentSpeech(meta, false);
+  }
+
+  return { cleaned };
 }
 
 async function handleToolCall(toolCall, meta) {
@@ -240,13 +475,39 @@ async function handleToolCall(toolCall, meta) {
   for (const call of calls) {
     if (call.name === 'submitLead') {
       const args = call.args || {};
+      const leadData = {
+        name: args.name || '',
+        company: args.company || '',
+        designation: args.designation || '',
+        phone: args.phone || '',
+        email: args.email || '',
+      };
+
+      // Never save silently — form must appear on screen for visitor to verify first
+      if (!meta.leadFormShown) {
+        emitLeadForm(meta, leadData);
+        responses.push({
+          id: call.id,
+          name: call.name,
+          response: {
+            result:
+              'Lead form is now on screen. Read the details aloud, ask the visitor to confirm. '
+              + 'Call submitLead again ONLY after they say yes / sahi hai.',
+            formShown: true,
+            saved: false,
+          },
+        });
+        console.log('[live] submitLead blocked — form shown for confirmation first', leadData);
+        continue;
+      }
+
       try {
         const lead = await saveLead({
-          name: args.name,
-          company: args.company || '',
-          designation: args.designation || '',
-          phone: args.phone,
-          email: args.email,
+          name: leadData.name,
+          company: leadData.company,
+          designation: leadData.designation,
+          phone: leadData.phone,
+          email: leadData.email,
           chatbotId: meta.chatbotId,
           sessionId: meta.sessionId,
           topic_counts: meta.topicCounts,
@@ -286,11 +547,17 @@ async function handleToolCall(toolCall, meta) {
     meta.leadDraft = { name: '', company: '', designation: '', phone: '', email: '' };
     meta.leadFormShown = false;
     meta.currentSlideshow = [];
+    meta.pendingSlideshow = null;
+    meta.slideshowEmittedKey = null;
     meta.isActivated = false;
+    meta.suppressOutput = true;
+    meta.ignoreWakeUntil = Date.now() + 5000;
+    meta.wakePending = false;
     meta.userUtteranceBuffer = '';
     meta.userStreamBuffer = '';
     meta.greetNudgeSent = false;
     meta.lastSpeechEndAt = 0;
+    emitJson(meta.socket, { type: 'chat_ended', reason: 'lead_saved' });
     emitJson(meta.socket, { type: 'show_onboarding', reason: 'chat_ended' });
     console.log('[live] Lead saved — session stays open, onboarding restored');
   }
@@ -318,15 +585,18 @@ function appendTranscript(buffer, chunk) {
 }
 
 function flushUserTranscript(meta) {
-  const full = meta.userStreamBuffer.trim();
+  const full = cleanTranscriptNoise(meta.userStreamBuffer);
   meta.userStreamBuffer = '';
   if (!full || isNoiseTranscript(full)) return;
 
-  console.log(`[live] User said: "${full}"`);
+  console.log(`[live] USER said: "${full}"`);
   emitJson(meta.socket, { type: 'transcript', role: 'user', text: full, final: true });
 
   if (!meta.isActivated && detectActivation(full, meta.chatbot)) {
-    activateSession(meta, full);
+    console.log(`[live] Activation keyword matched in STT: "${full}"`);
+    activateSession(meta, full, { greet: true });
+  } else if (!meta.isActivated) {
+    console.log(`[live] Onboarding — heard "${full}" but not an activation keyword`);
   }
 
   if (meta.isActivated) {
@@ -339,47 +609,89 @@ function flushUserTranscript(meta) {
 function flushAssistantTranscript(meta) {
   const full = stripMarkerText(meta.assistantBuffer).trim();
   if (!full) return;
+  // Ignore empty/silence stubs after End Chat
+  if (/^\(?\s*silence\s*\)?$/i.test(full) || full.length < 2) return;
   console.log(`[live] Bot said: "${full}"`);
   emitJson(meta.socket, { type: 'transcript', role: 'assistant', text: full, final: true });
+
+  // Bot often reads details aloud without emitting SHOW_LEAD_FORM — still show the form
+  mergeLeadDraft(meta, full);
 }
 
-function activateSession(meta, heard) {
-  if (meta.isActivated) return;
+function cleanTranscriptNoise(text) {
+  return String(text || '')
+    .replace(/<noise>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function activateSession(meta, heard, { greet = false } = {}) {
+  if (meta.isActivated) return false;
+  if (meta.ignoreWakeUntil && Date.now() < meta.ignoreWakeUntil) {
+    console.log('[live] Activation blocked — post end-chat cooldown');
+    return false;
+  }
+
+  if (meta.wakeActivationTimer) {
+    clearTimeout(meta.wakeActivationTimer);
+    meta.wakeActivationTimer = null;
+  }
+  if (meta.wakeAudioEndTimer) {
+    clearTimeout(meta.wakeAudioEndTimer);
+    meta.wakeAudioEndTimer = null;
+  }
+
   meta.isActivated = true;
+  meta.activatedAt = Date.now();
+  meta.wakePending = false;
+  meta.ignoreWakeUntil = 0;
+  meta.suppressOutput = false;
   emitJson(meta.socket, { type: 'activated' });
-  console.log(`[live] Activated — heard: "${heard}"`);
+  console.log(`[live] Activated — heard: "${heard}"${greet ? ' (with greet nudge)' : ''}`);
 
-  const botName = meta.chatbot.name || 'Assistant';
-  const greetingTopics = buildTopicGreeting(meta.topics || []);
-
-  if (meta.geminiSession && !meta.greetNudgeSent) {
+  // Only nudge when Gemini did not already hear the user (empty STT fallback).
+  if (greet && meta.geminiSession && !meta.greetNudgeSent) {
     meta.greetNudgeSent = true;
+    const botName = meta.chatbot.name || 'Assistant';
+    const greetingTopics = buildTopicGreeting(meta.topics || []);
     try {
       meta.geminiSession.sendClientContent({
         turns: [{
           role: 'user',
           parts: [{
-            text: `[USER_ACTIVATED] User woke you. Greet warmly as ${botName} in AUDIO. `
-              + `Introduce yourself and naturally mention you can help with: ${greetingTopics}. `
-              + `Then ask what they would like to know. Sound human — no AI/PDF language.`,
+            text:
+              `[USER_ACTIVATED] Greet once as ${botName} in AUDIO. `
+              + `Warm detailed intro: who you are, that you help with ${greetingTopics}, `
+              + `features/benefits/how things work. Invite any question. `
+              + `About 4–5 spoken sentences. [[TOPIC: General]]. No PDF names. Never say "and more".`,
           }],
         }],
         turnComplete: true,
       });
     } catch (err) {
       console.warn('[live] Activation nudge failed:', err.message);
+      meta.greetNudgeSent = false;
     }
   }
+
+  return true;
 }
 
 function accumulateUserTranscript(meta, chunk) {
-  if (isNoiseTranscript(chunk)) return;
+  const cleaned = cleanTranscriptNoise(chunk);
+  if (!cleaned || isNoiseTranscript(cleaned)) return;
 
-  meta.userStreamBuffer = appendTranscript(meta.userStreamBuffer, chunk);
+  meta.userStreamBuffer = appendTranscript(meta.userStreamBuffer, cleaned);
   meta.userUtteranceBuffer = meta.userStreamBuffer;
 
+  if (!meta.isActivated) {
+    console.log(`[live] STT (wake): "${meta.userStreamBuffer}"`);
+  }
+
   if (!meta.isActivated && detectActivation(meta.userStreamBuffer, meta.chatbot)) {
-    activateSession(meta, meta.userStreamBuffer);
+    // Prefer greet nudge so intro is never lost if pre-activate audio was dropped
+    activateSession(meta, meta.userStreamBuffer, { greet: true });
   }
 }
 
@@ -390,6 +702,7 @@ function stripMarkerText(text) {
     .replace(/\[SHOW_LEAD_FORM[^\]]*\]/gi, '')
     .replace(/\[ACTIVATE_CAMERA\]/gi, '')
     .replace(/\[USER_ACTIVATED\][^\n]*/gi, '')
+    .replace(/\[SESSION_ENDED\][^\n]*/gi, '')
     .replace(/\[WAKE\][^\n]*/gi, '')
     .replace(/\[Image\s*\d+\]/gi, '')
     .replace(/\bshow\s+image(?:\s+(?:number\s*)?\d+)?\b/gi, '')
@@ -425,8 +738,15 @@ function handleLiveMessage(meta, message) {
   if (!sc) return;
 
   if (sc.interrupted) {
-    emitJson(meta.socket, { type: 'interrupted' });
+    if (meta.isActivated && !meta.suppressOutput) {
+      emitJson(meta.socket, { type: 'interrupted' });
+    }
     meta.assistantBuffer = '';
+    meta.spokenTurnText = '';
+    meta.imageShownThisTurn = false;
+    meta.lastShownImageId = null;
+    meta.lastSpeechSyncLen = 0;
+    meta.deferredShowImageIds = [];
     meta.userStreamBuffer = '';
     meta.topicDispatchedThisTurn = false;
   }
@@ -435,31 +755,48 @@ function handleLiveMessage(meta, message) {
     accumulateUserTranscript(meta, sc.inputTranscription.text.trim());
   }
 
-  // Always forward bot audio — Gemini greets from live audio immediately (no backend delay)
+  // Forward bot audio only while active + not suppressed.
+  // Never activate from wakePending alone — STT must contain a real keyword/greeting.
   const parts = sc.modelTurn?.parts || [];
   for (const part of parts) {
     const inline = part.inlineData;
     if (inline?.data && inline?.mimeType?.includes('audio')) {
+      if (meta.suppressOutput) continue;
       if (!meta.isActivated) {
-        activateSession(meta, 'bot responded to wake phrase');
+        if (meta.ignoreWakeUntil && Date.now() < meta.ignoreWakeUntil) continue;
+        const buf = String(meta.userStreamBuffer || '').trim();
+        if (!buf || !detectActivation(buf, meta.chatbot)) continue;
+        activateSession(meta, buf, { greet: true });
+        if (!meta.isActivated) continue;
       }
       emitJson(meta.socket, { type: 'audio', data: inline.data, mimeType: inline.mimeType });
     }
   }
 
   if (sc.outputTranscription?.text) {
-    if (meta.isActivated) {
+    if (meta.isActivated && !meta.suppressOutput) {
       parseAssistantMarkers(meta, sc.outputTranscription.text);
     } else {
-      meta.assistantBuffer += sc.outputTranscription.text;
+      // Drop leftover model text while onboarding / after End Chat
+      meta.assistantBuffer = '';
     }
   }
 
   if (sc.turnComplete) {
     flushUserTranscript(meta);
-    flushAssistantTranscript(meta);
-    emitJson(meta.socket, { type: 'turn_complete' });
+    if (meta.isActivated && !meta.suppressOutput) {
+      flushDeferredShowImages(meta, true);
+      revalidateShownImage(meta);
+      autoSyncImageFromSpeech(meta);
+      flushAssistantTranscript(meta);
+      emitJson(meta.socket, { type: 'turn_complete' });
+    }
     meta.assistantBuffer = '';
+    meta.spokenTurnText = '';
+    meta.imageShownThisTurn = false;
+    meta.lastShownImageId = null;
+    meta.lastSpeechSyncLen = 0;
+    meta.deferredShowImageIds = [];
     meta.topicDispatchedThisTurn = false;
   }
 }
@@ -543,6 +880,7 @@ async function startGeminiLiveForSocket(socket, chatbot, knowledgeText) {
   const meta = createSessionMeta(socket, chatbot);
   const ai = new GoogleGenAI({ apiKey: geminiConfig.apiKey });
   const systemText = buildChatbotLiveInstruction(chatbot, knowledgeText);
+  console.log(`[live] System instruction ${systemText.length} chars (keep small for fast replies)`);
 
   const liveConfig = {
     responseModalities: [Modality.AUDIO],
@@ -558,12 +896,13 @@ async function startGeminiLiveForSocket(socket, chatbot, knowledgeText) {
     inputAudioTranscription: {},
     outputAudioTranscription: {},
     realtimeInputConfig: {
+      // Hear user quickly; allow bot to finish long detailed answers
       activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
       automaticActivityDetection: {
         startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
         endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
-        silenceDurationMs: 280,
-        prefixPaddingMs: 40,
+        silenceDurationMs: 650,
+        prefixPaddingMs: 100,
       },
     },
   };
@@ -608,6 +947,14 @@ function sendLiveAudio(socketId, { data, mimeType }) {
   const entry = getSessionEntry(socketId);
   if (!entry?.geminiSession || !entry.setupDone?.()) return false;
   if (!entry.meta?.micEnabled) return false;
+  // Drop uplink during post-end cooldown so echo cannot re-wake the model
+  if (
+    !entry.meta.isActivated
+    && entry.meta.ignoreWakeUntil
+    && Date.now() < entry.meta.ignoreWakeUntil
+  ) {
+    return false;
+  }
 
   const count = (audioChunkCounts.get(socketId) || 0) + 1;
   audioChunkCounts.set(socketId, count);
@@ -623,10 +970,17 @@ function sendLiveAudio(socketId, { data, mimeType }) {
 
 function interruptLiveSession(socketId) {
   const entry = getSessionEntry(socketId);
-  if (!entry?.geminiSession) return false;
+  if (!entry?.geminiSession || !entry.meta) return false;
+  // Do NOT send audioStreamEnd here — that ends the user turn.
+  // Barge-in needs continuous mic uplink so Gemini VAD can interrupt generation.
+  // Frontend already stops local playback; clear local turn buffers only.
   try {
-    // User started speaking — end audio stream so Gemini VAD can barge-in
-    entry.geminiSession.sendRealtimeInput({ audioStreamEnd: true });
+    const meta = entry.meta;
+    meta.assistantBuffer = '';
+    meta.spokenTurnText = '';
+    meta.deferredShowImageIds = [];
+    meta.topicDispatchedThisTurn = false;
+    console.log(`[live] Barge-in (socket ${socketId}) — waiting for user audio`);
     return true;
   } catch {
     return false;
@@ -654,45 +1008,160 @@ function endLiveAudioStream(socketId) {
   }
 }
 
-/** User finished speaking — commit ONE turn; debounced wake prompt */
-function handleUserSpeechEnd(socketId) {
+/** Wake path: frontend already detected a real spoken phrase. */
+function handleWakeAttempt(socketId) {
   const entry = getSessionEntry(socketId);
   if (!entry?.geminiSession) return;
 
   const meta = entry.meta;
   if (!meta || meta.isActivated) return;
+  if (meta.ignoreWakeUntil && Date.now() < meta.ignoreWakeUntil) {
+    console.log('[live] Wake ignored — post end-chat cooldown');
+    return;
+  }
 
   const now = Date.now();
-  if (now - (meta.lastSpeechEndAt || 0) < 2500) return;
+  if (now - (meta.lastSpeechEndAt || 0) < 900) return;
+  // Already waiting on a wake — don't reset the timer (spam cancels greeting)
+  if (meta.wakePending && meta.wakeActivationTimer) {
+    console.log('[live] Wake already pending — ignoring duplicate');
+    return;
+  }
   meta.lastSpeechEndAt = now;
+  meta.wakePending = true;
 
+  console.log(`[live] Wake attempt (socket ${socketId}) — waiting for STT keyword match`);
+
+  // Do NOT cut the stream instantly — give Gemini time to produce inputTranscription.
+  if (meta.wakeAudioEndTimer) clearTimeout(meta.wakeAudioEndTimer);
+  meta.wakeAudioEndTimer = setTimeout(() => {
+    meta.wakeAudioEndTimer = null;
+    if (!meta.isActivated) endLiveAudioStream(socketId);
+  }, 550);
+
+  scheduleWakeActivation(meta);
+}
+
+/** After activation, Gemini automatic VAD owns turn-taking — do NOT audioStreamEnd. */
+function handleUserSpeechEnd(socketId) {
+  const entry = getSessionEntry(socketId);
+  if (!entry?.geminiSession || !entry.meta) return;
+  if (entry.meta.isActivated) return;
+  // Wake path owns audio_end timing
+  if (entry.meta.wakePending) return;
   endLiveAudioStream(socketId);
+}
 
-  if (meta.greetNudgeSent) return;
+function scheduleWakeActivation(meta) {
+  if (meta.wakeActivationTimer) {
+    clearTimeout(meta.wakeActivationTimer);
+    meta.wakeActivationTimer = null;
+  }
 
-  meta.greetNudgeSent = true;
-  const botName = meta.chatbot?.name || 'Assistant';
-  const key = meta.chatbot?.activationKey || '';
-  const greetingTopics = buildTopicGreeting(meta.topics || []);
+  const tryActivateFromStt = () => {
+    if (meta.isActivated) return true;
+    if (meta.ignoreWakeUntil && Date.now() < meta.ignoreWakeUntil) return false;
+    const buf = cleanTranscriptNoise(meta.userStreamBuffer || meta.userUtteranceBuffer || '');
+    if (buf) {
+      console.log(`[live] Wake STT buffer: "${buf}"`);
+    }
+    if (buf && detectActivation(buf, meta.chatbot)) {
+      // STT matched — still nudge greet so user always hears intro (audio may have been dropped pre-activate)
+      activateSession(meta, buf, { greet: true });
+      return true;
+    }
+    return false;
+  };
 
-  console.log(`[live] Turn committed — greeting for "${botName}"`);
+  if (tryActivateFromStt()) return;
+
+  // Wait longer for STT — previous 1.4s window was too short (salam never matched).
+  const delays = [500, 1000, 1600, 2400, 3500];
+  let step = 0;
+
+  const tick = () => {
+    if (tryActivateFromStt()) return;
+    if (step >= delays.length) {
+      const buf = cleanTranscriptNoise(meta.userStreamBuffer || meta.userUtteranceBuffer || '');
+      const keys = String(meta.chatbot?.activationKey || '').trim() || '(none)';
+      console.log(
+        `[live] Wake STT finished — NOT activating (no DB keyword match). `
+        + `keys=[${keys}] buffer="${buf || '(empty)'}"`
+      );
+      meta.wakePending = false;
+      if (meta.wakeActivationTimer) {
+        clearTimeout(meta.wakeActivationTimer);
+        meta.wakeActivationTimer = null;
+      }
+      return;
+    }
+    const wait = delays[step];
+    step += 1;
+    meta.wakeActivationTimer = setTimeout(tick, wait);
+  };
+
+  tick();
+}
+
+/**
+ * Hard-end conversation: onboarding, deactivate, wait for activation keyword again.
+ */
+function endLiveConversation(socketId) {
+  const entry = getSessionEntry(socketId);
+  if (!entry?.meta) return false;
+
+  const meta = entry.meta;
+
+  // Block accidental End Chat clicks right as greeting starts (button appears under finger)
+  if (meta.isActivated && meta.activatedAt && Date.now() - meta.activatedAt < 5000) {
+    console.warn('[live] Ignoring end_chat — too soon after activation');
+    return false;
+  }
 
   try {
-    entry.geminiSession.sendClientContent({
-      turns: [{
-        role: 'user',
-        parts: [{
-          text: `[WAKE] User spoke (maybe "${key}" or "${botName}" or salam). `
-            + `Greet warmly in AUDIO as ${botName}. Mention you can help with: ${greetingTopics}. `
-            + `Ask what they want to know. Human tone only — never mention PDF or AI.`,
-        }],
-      }],
-      turnComplete: true,
-    });
-  } catch (err) {
-    console.warn('[live] Wake prompt failed:', err.message);
-    meta.greetNudgeSent = false;
+    entry.geminiSession?.sendRealtimeInput({ audioStreamEnd: true });
+  } catch {
+    /* ignore */
   }
+
+  if (meta.wakeActivationTimer) {
+    clearTimeout(meta.wakeActivationTimer);
+    meta.wakeActivationTimer = null;
+  }
+  if (meta.wakeAudioEndTimer) {
+    clearTimeout(meta.wakeAudioEndTimer);
+    meta.wakeAudioEndTimer = null;
+  }
+
+  meta.isActivated = false;
+  meta.activatedAt = 0;
+  meta.wakePending = false;
+  meta.suppressOutput = true; // drop any leftover model audio/text until real wake
+  // Block accidental re-wake from leftover speaker echo / mic noise after End Chat
+  meta.ignoreWakeUntil = Date.now() + 5000;
+  meta.leadDraft = { name: '', company: '', designation: '', phone: '', email: '' };
+  meta.leadFormShown = false;
+  meta.currentSlideshow = [];
+  meta.pendingSlideshow = null;
+  meta.fullPdfPool = [];
+  meta.slideshowEmittedKey = null;
+  meta.userUtteranceBuffer = '';
+  meta.userStreamBuffer = '';
+  meta.assistantBuffer = '';
+  meta.spokenTurnText = '';
+  meta.deferredShowImageIds = [];
+  meta.greetNudgeSent = false;
+  meta.topicDispatchedThisTurn = false;
+  meta.lastSpeechEndAt = 0;
+  meta.lastShownImageId = null;
+  meta.lastSpeechSyncLen = 0;
+
+  emitJson(meta.socket, { type: 'chat_ended', reason: 'user_ended' });
+  emitJson(meta.socket, { type: 'show_onboarding', reason: 'chat_ended' });
+
+  // Do NOT sendClientContent here — that made Gemini emit "(Silence)" and look "alive".
+  console.log(`[live] Conversation ended — cooldown 5s, keyword required (bot "${meta.chatbot?.name}")`);
+  return true;
 }
 
 async function stopGeminiLiveForSocket(socketId) {
@@ -720,9 +1189,12 @@ module.exports = {
   sendLiveText,
   endLiveAudioStream,
   handleUserSpeechEnd,
+  handleWakeAttempt,
+  endLiveConversation,
   stopGeminiLiveForSocket,
   liveSessions,
   mergeLeadDraft,
+  emitLeadForm,
   getSessionEntry,
   setMicEnabled,
   interruptLiveSession,

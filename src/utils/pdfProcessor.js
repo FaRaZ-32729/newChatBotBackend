@@ -31,7 +31,13 @@ const processPDFImages = async (pdfPath, chatbotName, pdfName) => {
 
     try {
         ({ stdout, stderr } = await execFileAsync(PYTHON_BIN, [scriptPath, pdfPath, outputDir], {
-            maxBuffer: 1024 * 1024 * 20 // 20MB, in case a PDF has lots of images
+            maxBuffer: 1024 * 1024 * 20, // 20MB
+            encoding: 'utf8',
+            env: {
+                ...process.env,
+                PYTHONIOENCODING: 'utf-8',
+                PYTHONUTF8: '1',
+            },
         }));
     } catch (error) {
         const detail = error.stderr || error.message || 'Unknown error';

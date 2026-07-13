@@ -9,7 +9,7 @@ const { initSocketServer } = require('./src/socket');
 
 const centeralRoutes = require('./src/routes/centeralRoutes');
 
-dotenv.config();
+dotenv.config({ path: path.join(__dirname, '.env') });
 dbConnection();
 
 const port = process.env.PORT || 5056;

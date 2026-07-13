@@ -7,6 +7,9 @@ const authRoutes = require("./authRoutes");
 const userRoutes = require("./userRoutes");
 const chatbotRoutes = require("./chatbotRoutes");
 const voiceRoutes = require("./voiceRoutes");
+const cardScanRoutes = require("./cardScanRoutes");
+const leadRoutes = require("./leadRoutes");
+const angleRoutes = require("./angleRoutes");
 
 
 // Mount all routes with proper prefixes
@@ -15,6 +18,9 @@ router.use("/users", userRoutes);
 router.use("/chatbot", chatbotRoutes);
 // Voice / LLM routes live in their own folder tree under /api/voice
 router.use("/voice", voiceRoutes);
+router.use("/card-scan", cardScanRoutes);
+router.use("/leads", leadRoutes);
+router.use("/", angleRoutes);
 
 
 // Health check route

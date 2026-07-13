@@ -2,138 +2,261 @@ const {
   buildNumberedImageCatalog,
 } = require('./chatbotImageService');
 
-function trimKnowledgeForLive(text, maxChars = 9000) {
-  const raw = String(text || '').trim();
-  if (!raw) return '';
-  if (raw.length <= maxChars) return raw;
-  return `${raw.slice(0, maxChars)}\n\n[Knowledge truncated for voice session.]`;
+function cleanTopicDisplayName(name) {
+  return String(name || '')
+    .replace(/\.pdf$/i, '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b(pvt\.?\s*ltd\.?|private\s+limited|profile\s*\d{2,4}|rag)\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*[.,;]+\s*$/g, '')
+    .trim();
 }
 
 function buildTopicGreeting(topics) {
-  if (!topics.length) return 'general information I have available';
-  const names = topics.map((t) => t.displayName).filter(Boolean);
+  if (!topics.length) return 'our products and services';
+  const names = topics.map((t) => cleanTopicDisplayName(t.displayName)).filter(Boolean);
   if (names.length === 1) return names[0];
-  if (names.length === 2) return `${names[0]} and ${names[1]}`;
-  return `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}`;
+  if (names.length === 2) return `${names[0]} aur ${names[1]}`;
+  return `${names.slice(0, -1).join(', ')}, aur ${names[names.length - 1]}`;
+}
+
+function splitKnowledgeDocuments(knowledgeText) {
+  const raw = String(knowledgeText || '');
+  const parts = raw.split(/\n*===== DOCUMENT:\s*/i);
+  const docs = [];
+
+  for (let i = 1; i < parts.length; i += 1) {
+    const chunk = parts[i];
+    const nl = chunk.indexOf('\n');
+    const nameLine = (nl >= 0 ? chunk.slice(0, nl) : chunk)
+      .replace(/=+/g, '')
+      .replace(/\.pdf$/i, '')
+      .trim();
+    const body = (nl >= 0 ? chunk.slice(nl + 1) : '')
+      .replace(/----------------Page.*?----------------/gi, '\n')
+      .trim();
+    if (nameLine || body) {
+      docs.push({ name: nameLine || `Document ${i}`, body });
+    }
+  }
+
+  if (!docs.length && raw.trim()) {
+    docs.push({ name: 'Knowledge', body: raw.trim() });
+  }
+  return docs;
+}
+
+function compressWhitespace(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function extractProductIdentity(body, maxLen = 220) {
+  const cleaned = compressWhitespace(body);
+  if (!cleaned) return '';
+
+  const window = cleaned.slice(0, Math.min(cleaned.length, 3500));
+  const patterns = [
+    /comp\s*anion\s+for\s+hajj\s*(?:&|and)\s*umrah[^.!?]{0,100}/i,
+    /mushaba\s+is\s+a\s+mobile\s+app[^.!?]{10,140}/i,
+    /during\s+hajj\s+or\s+umrah[^.!?]{10,140}/i,
+    /every\s+year[^.!?]{0,40}(?:hajj|umrah)[^.!?]{10,120}/i,
+    /(?:is a|helps|designed to|made to)\s+(?:mobile\s+)?(?:app|platform|solution|companion)[^.!?]{10,120}/i,
+    /(?:tagline|overview)\s*[:\-–]?\s*[^.!?]{8,100}/i,
+  ];
+
+  for (const re of patterns) {
+    const m = window.match(re);
+    if (!m) continue;
+    const start = Math.max(0, m.index - 30);
+    let snippet = compressWhitespace(window.slice(start, m.index + m[0].length + 40));
+    return snippet.slice(0, maxLen);
+  }
+
+  return cleaned.slice(0, maxLen);
+}
+
+function pickDocumentExcerpt(body, budget) {
+  const cleaned = compressWhitespace(body);
+  if (!cleaned) return '';
+  if (cleaned.length <= budget) return cleaned;
+
+  const identity = extractProductIdentity(body, Math.min(200, Math.floor(budget * 0.4)));
+  const anchors = [
+    /companion\s+for\s+hajj/i,
+    /during\s+hajj\s+or\s+umrah/i,
+    /the\s+problem\s+\w+\s+solves/i,
+    /key\s+features/i,
+    /overview/i,
+  ];
+
+  const chunks = [];
+  const pushUnique = (piece) => {
+    const p = compressWhitespace(piece);
+    if (!p || p.length < 30) return;
+    if (chunks.some((c) => c.includes(p.slice(0, 40)))) return;
+    chunks.push(p);
+  };
+
+  if (identity) pushUnique(identity);
+  for (const re of anchors) {
+    const m = cleaned.match(re);
+    if (!m || m.index == null) continue;
+    pushUnique(cleaned.slice(Math.max(0, m.index - 20), m.index + Math.min(420, budget)));
+    if (chunks.join(' ').length >= budget) break;
+  }
+
+  let out = chunks.join(' … ');
+  if (out.length < budget * 0.4) out = cleaned.slice(0, budget);
+  return out.slice(0, budget);
 }
 
 /**
- * Live system instruction for ONE chatbot session.
+ * Keep live prompt small — large context = slow first audio (20s+).
  */
+function buildBalancedKnowledgeForLive(knowledgeText, maxChars = 4500) {
+  const docs = splitKnowledgeDocuments(knowledgeText);
+  if (!docs.length) return '';
+
+  const overhead = docs.length * 70;
+  const perDoc = Math.max(550, Math.floor((maxChars - overhead) / docs.length));
+
+  const sections = docs.map((doc) => {
+    const identity = extractProductIdentity(doc.body, 180);
+    const bodyBudget = Math.max(350, perDoc - identity.length - 30);
+    const body = pickDocumentExcerpt(doc.body, bodyBudget);
+    return [
+      `===== ${cleanTopicDisplayName(doc.name)} =====`,
+      identity ? `PURPOSE: ${identity}` : null,
+      body,
+    ].filter(Boolean).join('\n');
+  });
+
+  let out = sections.join('\n\n');
+  if (out.length > maxChars) out = `${out.slice(0, maxChars)}\n…`;
+  return out;
+}
+
+function trimKnowledgeForLive(text, maxChars = 4500) {
+  return buildBalancedKnowledgeForLive(text, maxChars);
+}
+
+/** Compact image index for speed — unique sections only, short labels. */
+function formatImageIndexForPrompt(catalog, _knowledgeText, maxImages = 36) {
+  if (!catalog.length) return '(none)';
+
+  const byPdf = new Map();
+  for (const img of catalog) {
+    if (!byPdf.has(img.pdfKey)) byPdf.set(img.pdfKey, []);
+    byPdf.get(img.pdfKey).push(img);
+  }
+
+  const lines = [];
+  let count = 0;
+  for (const [pdfKey, imgs] of byPdf) {
+    lines.push(`--- ${pdfKey} ---`);
+    const seen = new Set();
+    for (const img of imgs) {
+      if (count >= maxImages) {
+        lines.push(`(+ ids up to ${catalog.length})`);
+        return lines.join('\n');
+      }
+      const topicKey = String(img.topic || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      if (seen.has(topicKey)) continue;
+      seen.add(topicKey);
+      lines.push(`[${img.id}] ${String(img.topic || '').slice(0, 70)}`);
+      count += 1;
+    }
+  }
+  return lines.join('\n');
+}
+
 function buildChatbotLiveInstruction(chatbot, knowledgeText) {
   const botName = chatbot.name || 'Assistant';
   const activationKey = (chatbot.activationKey || '').trim();
   const extraInstructions = (chatbot.specificInstructions || '').trim();
   const scanCardRequired = Boolean(chatbot.scanCardRequired);
-  const context = trimKnowledgeForLive(knowledgeText);
+  // Enough context for detailed answers; still capped for latency
+  const context = buildBalancedKnowledgeForLive(knowledgeText, 5500);
   const { catalog, topics } = buildNumberedImageCatalog(chatbot);
 
   const topicListText = topics.length
-    ? topics.map((t) => `- "${t.pdfKey}" → ${t.displayName}`).join('\n')
-    : '(No documents loaded)';
+    ? topics.map((t) => `- "${t.pdfKey}" = ${cleanTopicDisplayName(t.displayName)}`).join('\n')
+    : '(none)';
 
   const greetingTopics = buildTopicGreeting(topics);
-
-  const imageListText = catalog.length
-    ? catalog
-        .map((img) => `[Image ${img.id}] (${img.pdfName}) ${img.topic}`)
-        .join('\n')
-    : '(No images extracted yet)';
+  const spokenTopicBullets = topics.length
+    ? topics.map((t) => `• ${cleanTopicDisplayName(t.displayName)}`).join('\n')
+    : '• (none)';
+  const imageListText = formatImageIndexForPrompt(catalog, knowledgeText, 48);
 
   const leadSection = scanCardRequired
-    ? `
-CONTACT COLLECTION (when user wants to end chat — yes, end, finish, goodbye):
-- FIRST ask exactly: "Would you like to give me your details verbally, or would you prefer to hold up your visiting card to the camera?"
-- PATH A (Voice): Ask Name, Company, Designation, Phone, Email one at a time. After all five, use [SHOW_LEAD_FORM|...] marker AND read every field aloud (see RULE 6), then ask "Is this information correct?"
-- PATH B (Card scan): If user chooses card/scan/camera, respond EXACTLY:
-  "Great, please hold your card up to the camera. [ACTIVATE_CAMERA]"
-  Then STOP and wait for [CARD_SCANNED] system message. Use extracted data for confirmation with [SHOW_LEAD_FORM|...] marker.
-- If user says details are WRONG, ask what to correct, update, emit [SHOW_LEAD_FORM|...] again, ask again until they confirm.
-- When user confirms YES/correct, call submitLead tool IMMEDIATELY.
-- NEVER invent Name, Company, Phone, or Email. If email missing say: "I do not find your email. Tell me your email verbally."
-- Before asking for missing email, repeat Name and Phone if you have them.`
-    : `
-CONTACT COLLECTION (when user wants to end chat):
-- Collect Name, Company, Designation, Phone, Email verbally one at a time.
-- Confirm with [SHOW_LEAD_FORM|...] marker AND read every field aloud (see RULE 6), then ask if correct.
-- If user says details are wrong, correct and re-confirm with updated [SHOW_LEAD_FORM|...] marker.
-- When user confirms, call submitLead immediately.
-- NEVER invent user details.`;
+    ? `LEAD CAPTURE (when user wants to end / leave details / goodbye):
+- FIRST ask: verbally share details, or scan visiting card on camera?
+- PATH A (Voice): Ask Name, then Company, Designation, Phone, Email — one at a time.
+  As soon as you have Name + Phone (or Name + Email), emit EXACTLY:
+  [SHOW_LEAD_FORM|Name|Company|Designation|Phone|Email]
+  Then READ the details aloud and ask: "Kya yeh details sahi hain?"
+  On YES → call submitLead. On NO → correct fields, show form again, re-confirm.
+- PATH B (Card): Say you will open the camera, then emit [ACTIVATE_CAMERA] and STOP talking.
+- On [CARD_SCANNED]: form is already on screen — read the fields aloud, ask confirm, then submitLead on YES.
+- Never invent contact fields. Never skip the on-screen form.`
+    : `LEAD CAPTURE (when user wants to end / leave details / goodbye):
+- Collect Name, Company, Designation, Phone, Email one at a time.
+- When you have Name + Phone (or Name + Email), emit:
+  [SHOW_LEAD_FORM|Name|Company|Designation|Phone|Email]
+- Read details aloud, ask confirm. YES → submitLead. NO → fix and re-show form.
+- Never invent fields. Always show the form before saving.`;
 
-  return `You are "${botName}" — a warm, professional voice assistant at a company kiosk. You speak like a real helpful human, NOT like a chatbot or AI.
+  return `You are "${botName}" — a warm, professional kiosk voice expert. AUDIO ONLY. Speak like a knowledgeable human host.
 
-PERSONALITY — SOUND HUMAN:
-- Use natural, conversational language — warm, confident, polite.
-- NEVER say: "As an AI", "According to my PDF", "In my knowledge base", "I don't have that in my documents", "Based on my training", "Let me check my files".
-- NEVER mention PDFs, documents, databases, markers, images numbers, or any technical/system words to the visitor.
-- Vary your phrasing — do not repeat the same sentence structure every time.
-- AUDIO ONLY responses.
+STYLE:
+- Natural, clear, polite. Never say PDF, AI, knowledge base, markers, or image numbers aloud.
+- Match the user's language (Urdu / English / Roman Urdu).
+- Answers must be DETAILED and helpful — not short one-liners.
 
-CRITICAL — ACTIVATION:
-- Ignore background noise, "<noise>", coughs, unclear sounds.
-- Wake when user says "${activationKey}", "${botName}", or a clear greeting (hello, hi, salam, assalamu alaikum).
-- FIRST GREETING (mandatory after wake-up): Introduce yourself naturally as ${botName}, then IN YOUR OWN WORDS tell them what you can help with.
-  Example style: "Assalam o alaikum! I'm ${botName}. I can tell you about ${greetingTopics}. What would you like to know?"
-  Adapt to English or Urdu based on how the user greeted you. Mention the actual topic names above — not generic "our products".
-- Do NOT give a one-line "How can I help?" without mentioning your topics first.
+WAKE / INTRODUCTION (4–6 spoken sentences — warm & complete):
+- Wake ONLY on the activation phrase "${activationKey}" (do not treat hi/hello/other greetings as wake unless that is the activation phrase).
+- Introduce yourself properly: who you are, what you cover by NAME (not "and more"), what kind of help you give (features, benefits, how it works), then invite a question.
+- Example style: "Assalam o alaikum! Main ${botName} hoon. Main aapki ${greetingTopics} ke bare mein detail se batata hoon — features, benefits, aur kaise kaam karta hai. Aap kisi bhi product ya service ke bare mein poochhein, main clear jawab dunga."
+- Name the real topics. Never say vague "and more" / "aur more".
+- [[TOPIC: General]] only on greeting. No SHOW_IMAGE on greeting. Never greet twice.
+- After [SESSION_ENDED]: stay silent until a new wake / [USER_ACTIVATED].
 
-WHAT YOU KNOW ABOUT (internal reference — do NOT read this list robotically):
-${topics.map((t) => `• ${t.displayName}`).join('\n') || '• (No topics loaded yet)'}
+TOPICS (speak these names):
+${spokenTopicBullets}
 
-AVAILABLE TOPICS (hidden — for [[TOPIC: pdfKey]] marker only):
+TOPIC KEYS (hidden [[TOPIC: pdfKey]]):
 ${topicListText}
 
-COMPANY / PRODUCT CONTEXT (your source of truth):
-${context || 'No content loaded yet.'}
+CONTEXT (PURPOSE is authoritative):
+${context || '(empty)'}
 
-IMAGE INDEX (hidden — for [[SHOW_IMAGE:N]] marker only, NEVER speak these):
+IMAGES (hidden — [[SHOW_IMAGE:N]] only; match what YOU are saying right now):
 ${imageListText}
 
-OWNER INSTRUCTIONS:
-${extraInstructions || '(none)'}
+NOTES: ${extraInstructions || 'none'}
 
-RULE 0 — HIDDEN MARKERS (NEVER SPEAK ALOUD — CRITICAL):
-These exist ONLY for the screen system. They must NEVER appear in your spoken voice:
-- [[TOPIC:...]] [[SHOW_IMAGE:N]] [SHOW_LEAD_FORM|...] [ACTIVATE_CAMERA]
-- NEVER say: "show image", "image 1", "image number", "[Image 3]", "topic marker", or anything in brackets.
-- When the screen changes, just describe the content naturally: "Here you can see…" / "Yeh feature dekhiye…"
-- If you catch yourself about to say a marker word — stop and rephrase naturally.
-
-RULE 1 — TOPIC MARKER (hidden, every response):
-Start every response with [[TOPIC: pdfKey]] if question matches that document, or [[TOPIC: General]] if unrelated.
-
-RULE 2 — IMAGE SYNC (hidden markers only):
-- Emit [[SHOW_IMAGE:N]] silently when you start discussing that visual. Screen updates automatically.
-- Never narrate the marker — only describe what the visitor sees.
-
-RULE 3 — ANSWERING QUESTIONS (DETAILED, HUMAN):
-- Answer exactly what they asked first, then add helpful related details (5–10 sentences for product topics).
-- Pull facts ONLY from COMPANY / PRODUCT CONTEXT above.
-- Speak as if you work here and know this material personally.
-
-RULE 4 — OFF-TOPIC OR UNKNOWN QUESTIONS (POLITE, HUMAN):
-- If the question is NOT in your materials, say sorry naturally — like a real person would:
-  English: "I'm sorry, I don't have information on that. I can help you with ${greetingTopics} though — would any of that interest you?"
-  Urdu: "Maaf kijiye ga, is bare mein meray paas maloomat nahi. Main aap ko ${greetingTopics} ke bare mein bata sakta hoon — kya aap in mein se kuch sunna chahen ge?"
-- Do NOT mention PDFs, files, or AI limitations. Just a polite sorry and redirect to what you CAN help with.
-
-RULE 5 — LANGUAGE (URDU / ENGLISH):
-- Match the user's language. Urdu speech → respond in natural Urdu. English → English. Roman Urdu → Roman Urdu or Urdu.
-- Speech-to-text may show wrong script (Hindi/Devanagari) or broken spelling — understand MEANING from audio, never echo garbled text.
-- If you truly cannot understand, say politely: "Maaf kijiye, kya aap dobara batayenge?" / "Sorry, could you say that again?"
-
-RULE 6 — INACTIVITY:
-On "[INACTIVITY_CHECK]" say: "It seems like you've been quiet for a while. Do you want to end the chat?"
-
-RULE 7 — LEAD FORM (hidden marker + spoken confirmation):
-1. START with hidden [SHOW_LEAD_FORM|Name|Company|Designation|Phone|Email]
-2. THEN read every field aloud clearly and ask if correct.
-3. Never skip the spoken read-back.
+RULES:
+0) Never speak: [[TOPIC:]] [[SHOW_IMAGE:N]] [SHOW_LEAD_FORM|…] [ACTIVATE_CAMERA]
+1) Every reply starts with [[TOPIC:pdfKey]] or [[TOPIC: General]] matching YOUR answer content.
+2) PRODUCT IDENTITY: "kya hai / what is" → open with PURPOSE from CONTEXT (e.g. Mushaba = Hajj & Umrah companion). Do NOT lead with B2B/SaaS/Premium unless user asked business/pricing.
+3) IMAGE SYNC (critical): As YOU speak each point, emit [[SHOW_IMAGE:N]] whose title best matches that exact point (lost assistance → Lost Assistance ids; tracking → tracking; overview → Overview). Switch SHOW_IMAGE when you change sub-topic. Prefer exact title match. Never invent ids.
+4) DETAILED ANSWERS (required):
+   - Identity / overview: 5–8 clear sentences with concrete facts from CONTEXT.
+   - Features / how-it-works: up to ~10 sentences, structured (direct answer → key points → benefit → short follow-up).
+   - Do NOT give shallow 1–2 sentence replies for product questions.
+5) Unknown topic → polite sorry + redirect to ${greetingTopics}.
+6) Garbled STT → answer the meaning; don't repeat garbage.
+7) [INACTIVITY_CHECK] → ask if they want to end. [SESSION_ENDED] → absolute silence until wake.
 ${leadSection}`;
 }
 
 module.exports = {
   buildChatbotLiveInstruction,
+  buildBalancedKnowledgeForLive,
   trimKnowledgeForLive,
+  splitKnowledgeDocuments,
+  extractProductIdentity,
   buildTopicGreeting,
+  cleanTopicDisplayName,
 };
