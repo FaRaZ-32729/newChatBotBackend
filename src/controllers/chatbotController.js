@@ -3,6 +3,7 @@ const { upload } = require('../utils/uploadHelper');
 const { processPDFImages } = require('../utils/pdfProcessor');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const uploadAny = upload.any();
 
@@ -208,7 +209,7 @@ const deleteChatbot = async (req, res) => {
             return res.status(403).json({ success: false, message: "You can only delete your team's chatbots" });
         }
 
-        const chatbotFolderName = chatbot.name.replace(/[^a-zA-Z0-9]/g, '_');
+        const chatbotFolderName = getChatbotFolderName(chatbot);
         const folderPath = path.join(__dirname, '../../uploads/chatbots', chatbotFolderName);
 
         // Delete folder from disk
@@ -252,7 +253,8 @@ const getChatbotsByUser = async (req, res) => {
         }
 
         const chatbots = await ChatbotModel.find({
-            createdBy: ownerId
+            createdBy: ownerId,
+            isDemo: { $ne: true },
         })
             .sort({ createdAt: -1 })
             .populate('createdBy', 'name email role');
@@ -308,6 +310,228 @@ function getChatbotFolderName(chatbot) {
     if (match?.[1]) return match[1];
     return String(chatbot.name || 'default').replace(/[^a-zA-Z0-9]/g, '_');
 }
+
+async function destroyChatbotRecord(chatbot) {
+    const folderName = getChatbotFolderName(chatbot);
+    const safeName = String(folderName || '').replace(/[/\\]/g, '');
+    if (safeName && safeName !== '.' && safeName !== '..' && !safeName.includes('..')) {
+        const folderPath = path.join(__dirname, '../../uploads/chatbots', safeName);
+        const uploadsRoot = path.resolve(path.join(__dirname, '../../uploads/chatbots'));
+        const resolved = path.resolve(folderPath);
+        const rootPrefix = uploadsRoot.toLowerCase() + path.sep.toLowerCase();
+        if (resolved.toLowerCase().startsWith(rootPrefix) && fs.existsSync(resolved)) {
+            fs.rmSync(resolved, { recursive: true, force: true });
+            console.log(`[chatbot] Removed upload folder: ${safeName}`);
+        }
+    }
+    await ChatbotModel.findByIdAndDelete(chatbot._id);
+}
+
+function hashDemoToken(token) {
+    return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function demoTokensMatch(storedHash, token) {
+    if (!storedHash || !token) return false;
+    const a = Buffer.from(String(storedHash), 'hex');
+    const b = Buffer.from(hashDemoToken(token), 'hex');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+}
+
+function readDemoToken(req) {
+    const fromQuery = req.query?.token;
+    if (fromQuery) return String(fromQuery).trim();
+    if (req.body && typeof req.body === 'object' && req.body.token) {
+        return String(req.body.token).trim();
+    }
+    if (typeof req.body === 'string' && req.body.trim()) return req.body.trim();
+    return '';
+}
+
+const DEMO_DISCONNECT_GRACE_MS = 15 * 1000;
+const DEMO_STALE_MS = 3 * 60 * 1000;
+const DEMO_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+async function sweepExpiredDemoChatbots() {
+    const now = Date.now();
+    const demos = await ChatbotModel.find({ isDemo: true }).select(
+        '+demoCleanupTokenHash name onboardingImage knowledgeBasePdfs demoDisconnectedAt demoLastSeenAt createdAt'
+    );
+
+    for (const bot of demos) {
+        const disconnectedAt = bot.demoDisconnectedAt ? new Date(bot.demoDisconnectedAt).getTime() : 0;
+        const lastSeen = bot.demoLastSeenAt ? new Date(bot.demoLastSeenAt).getTime() : 0;
+        const createdAt = bot.createdAt ? new Date(bot.createdAt).getTime() : 0;
+
+        const leftAndGone = disconnectedAt && now - disconnectedAt >= DEMO_DISCONNECT_GRACE_MS;
+        const stale = lastSeen && now - lastSeen >= DEMO_STALE_MS;
+        const tooOld = createdAt && now - createdAt >= DEMO_MAX_AGE_MS;
+
+        if (!leftAndGone && !stale && !tooOld) continue;
+
+        try {
+            await destroyChatbotRecord(bot);
+            console.log(`[demo] Swept expired demo chatbot ${bot._id}`);
+        } catch (err) {
+            console.error(`[demo] Sweep failed for ${bot._id}:`, err.message);
+        }
+    }
+}
+
+let demoSweepTimer = null;
+function startDemoChatbotSweep() {
+    if (demoSweepTimer) return;
+    sweepExpiredDemoChatbots().catch((err) => console.error('[demo] sweep:', err.message));
+    demoSweepTimer = setInterval(() => {
+        sweepExpiredDemoChatbots().catch((err) => console.error('[demo] sweep:', err.message));
+    }, 10 * 1000);
+    if (typeof demoSweepTimer.unref === 'function') demoSweepTimer.unref();
+}
+
+const DEMO_INSTRUCTIONS =
+    'You are a short-lived demo voice assistant. Answer only from the uploaded document. '
+    + 'Be warm, clear, and helpful. Match the visitor language (English, Urdu, or Roman Urdu). '
+    + 'Do not invent facts that are not in the document.';
+
+const createDemoChatbot = async (req, res) => {
+    const folderName = `demo_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    req.uploadFolderName = folderName;
+    const createdFolders = [path.join(__dirname, '../../uploads/chatbots', folderName)];
+
+    uploadAny(req, res, async (err) => {
+        try {
+            if (err) {
+                cleanupChatbotUploads(createdFolders, req.files || []);
+                return res.status(400).json({ success: false, message: err.message });
+            }
+
+            const name = String(req.body?.name || '').trim();
+            if (!name || name.length < 2) {
+                cleanupChatbotUploads(createdFolders, req.files || []);
+                return res.status(400).json({ success: false, message: 'Chatbot name is required' });
+            }
+
+            const onboardingFile = req.files?.find((f) => f.fieldname === 'onboardingImage');
+            const pdfFiles = req.files?.filter((f) => f.fieldname === 'knowledgeBasePdfs') || [];
+
+            if (!onboardingFile) {
+                cleanupChatbotUploads(createdFolders, req.files || []);
+                return res.status(400).json({ success: false, message: 'An image is required' });
+            }
+
+            if (pdfFiles.length !== 1) {
+                cleanupChatbotUploads(createdFolders, req.files || []);
+                return res.status(400).json({
+                    success: false,
+                    message: 'Please upload exactly one PDF document',
+                });
+            }
+
+            const pdfFile = pdfFiles[0];
+            const pdfNameClean = pdfFile.originalname.replace(/\.pdf$/i, '').replace(/[^a-zA-Z0-9]/g, '_');
+            const extractedImages = await processPDFImages(pdfFile.path, folderName, pdfNameClean);
+
+            const knowledgeBasePdfs = [{
+                name: pdfFile.originalname,
+                url: `/uploads/chatbots/${folderName}/${pdfFile.filename}`,
+                size: `${(pdfFile.size / (1024 * 1024)).toFixed(2)} MB`,
+                extractedImages,
+            }];
+
+            const demoToken = crypto.randomBytes(24).toString('hex');
+            const saved = await ChatbotModel.create({
+                name,
+                onboardingImage: `/uploads/chatbots/${folderName}/${onboardingFile.filename}`,
+                knowledgeBasePdfs,
+                activationKey: 'hello',
+                specificInstructions: DEMO_INSTRUCTIONS,
+                scanCardRequired: false,
+                isDemo: true,
+                demoCleanupTokenHash: hashDemoToken(demoToken),
+                demoLastSeenAt: new Date(),
+                demoDisconnectedAt: null,
+            });
+
+            setImmediate(async () => {
+                try {
+                    const { getChatbotKnowledge } = require('../llm/services/knowledgeService');
+                    await getChatbotKnowledge(saved);
+                } catch (cacheErr) {
+                    console.error('[demo] knowledge cache warm-up failed:', cacheErr.message);
+                }
+            });
+
+            startDemoChatbotSweep();
+
+            res.status(201).json({
+                success: true,
+                message: 'Demo chatbot created',
+                data: {
+                    _id: saved._id,
+                    name: saved.name,
+                    activationKey: saved.activationKey,
+                    isDemo: true,
+                },
+                demoToken,
+            });
+        } catch (error) {
+            console.error('Create Demo Chatbot Error:', error);
+            cleanupChatbotUploads(createdFolders, req.files || []);
+            const message = error.message || 'Failed to create demo chatbot';
+            const status = /extraction failed/i.test(message) ? 422 : 500;
+            res.status(status).json({ success: false, message });
+        }
+    });
+};
+
+async function findDemoByToken(id, token) {
+    const chatbot = await ChatbotModel.findById(id).select('+demoCleanupTokenHash');
+    if (!chatbot || chatbot.isDemo !== true) return null;
+    if (!demoTokensMatch(chatbot.demoCleanupTokenHash, token)) return null;
+    return chatbot;
+}
+
+const heartbeatDemoChatbot = async (req, res) => {
+    try {
+        const chatbot = await findDemoByToken(req.params.id, readDemoToken(req));
+        if (!chatbot) {
+            return res.status(404).json({ success: false, message: 'Demo chatbot not found' });
+        }
+
+        chatbot.demoLastSeenAt = new Date();
+        chatbot.demoDisconnectedAt = null;
+        await chatbot.save();
+
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('Demo heartbeat error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+};
+
+const disconnectDemoChatbot = async (req, res) => {
+    try {
+        const chatbot = await findDemoByToken(req.params.id, readDemoToken(req));
+        if (!chatbot) {
+            return res.status(404).json({ success: false, message: 'Demo chatbot not found' });
+        }
+
+        const immediate = String(req.query?.immediate || req.body?.immediate || '') === '1';
+        if (immediate) {
+            await destroyChatbotRecord(chatbot);
+            return res.status(200).json({ success: true, deleted: true });
+        }
+
+        chatbot.demoDisconnectedAt = new Date();
+        await chatbot.save();
+
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('Demo disconnect error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+};
 
 function pdfImagesDir(folderName, pdfOriginalName) {
     const pdfNameClean = String(pdfOriginalName || '')
@@ -593,7 +817,7 @@ const updateChatbot = async (req, res) => {
 const getPublicChatbot = async (req, res) => {
     try {
         const { id } = req.params;
-        const chatbot = await ChatbotModel.findById(id).select('name onboardingImage isActive activationKey');
+        const chatbot = await ChatbotModel.findById(id).select('name onboardingImage isActive activationKey isDemo');
 
         if (!chatbot || chatbot.isActive === false) {
             return res.status(404).json({ success: false, message: 'Chatbot not found or inactive' });
@@ -606,6 +830,7 @@ const getPublicChatbot = async (req, res) => {
                 name: chatbot.name,
                 onboardingImage: chatbot.onboardingImage,
                 activationKey: chatbot.activationKey || '',
+                isDemo: chatbot.isDemo === true,
             },
         });
     } catch (error) {
@@ -616,6 +841,10 @@ const getPublicChatbot = async (req, res) => {
 
 module.exports = {
     createChatbot,
+    createDemoChatbot,
+    heartbeatDemoChatbot,
+    disconnectDemoChatbot,
+    startDemoChatbotSweep,
     updateChatbot,
     deleteChatbot,
     getChatbotsByUser,

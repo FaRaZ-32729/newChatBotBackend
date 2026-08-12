@@ -7,6 +7,7 @@ const cors = require('cors');
 const path = require('path');
 const { initSocketServer } = require('./src/socket');
 const { corsOriginDelegate, getAllowedOrigins } = require('./src/utils/corsOrigins');
+const { startDemoChatbotSweep } = require('./src/controllers/chatbotController');
 
 const centeralRoutes = require('./src/routes/centeralRoutes');
 
@@ -36,4 +37,5 @@ initSocketServer(httpServer);
 httpServer.listen(port, () => {
   console.log(`Express + Socket.IO running on port ${port}`);
   console.log(`[cors] Allowed origins: ${getAllowedOrigins().join(', ')}`);
+  startDemoChatbotSweep();
 });

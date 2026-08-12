@@ -32,6 +32,145 @@ const FALLBACK_LIVE_MODELS = [
 const liveSessions = new Map();
 const audioChunkCounts = new Map();
 
+function msBetween(start, end = Date.now()) {
+  if (!start) return null;
+  return Math.max(0, end - start);
+}
+
+function formatMs(ms) {
+  if (ms == null) return 'n/a';
+  if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`;
+  return `${ms}ms`;
+}
+
+function resetTurnLatency(meta, reason = '') {
+  meta.latency = {
+    turnId: (meta.latency?.turnId || 0) + 1,
+    reason: reason || '',
+    userAudioStartAt: 0,
+    lastUserAudioAt: 0,
+    userSpeechEndAt: 0,
+    firstUserSttAt: 0,
+    firstModelAudioAt: 0,
+    firstModelTextAt: 0,
+    turnCompleteAt: 0,
+    loggedFirstAudio: false,
+    loggedComplete: false,
+  };
+}
+
+function emitLatency(meta, phase, extra = {}) {
+  const L = meta.latency || {};
+  const now = Date.now();
+  const payload = {
+    type: 'latency',
+    phase,
+    turnId: L.turnId || 0,
+    serverNow: now,
+    sinceUserAudioStartMs: msBetween(L.userAudioStartAt, now),
+    sinceUserSpeechEndMs: msBetween(L.userSpeechEndAt, now),
+    userAudioToFirstSttMs: msBetween(L.userAudioStartAt, L.firstUserSttAt),
+    userAudioToFirstBotAudioMs: msBetween(L.userAudioStartAt, L.firstModelAudioAt),
+    speechEndToFirstBotAudioMs: msBetween(L.userSpeechEndAt, L.firstModelAudioAt),
+    userAudioToTurnCompleteMs: msBetween(L.userAudioStartAt, L.turnCompleteAt || now),
+    speechEndToTurnCompleteMs: msBetween(L.userSpeechEndAt, L.turnCompleteAt || now),
+    ...extra,
+  };
+
+  console.log(
+    `[LATENCY][BE] turn#${payload.turnId} ${phase}`
+    + ` | audio→STT ${formatMs(payload.userAudioToFirstSttMs)}`
+    + ` | audio→botAudio ${formatMs(payload.userAudioToFirstBotAudioMs)}`
+    + ` | speechEnd→botAudio ${formatMs(payload.speechEndToFirstBotAudioMs)}`
+    + ` | audio→done ${formatMs(payload.userAudioToTurnCompleteMs)}`
+    + (extra.detail ? ` | ${extra.detail}` : '')
+  );
+
+  try {
+    emitJson(meta.socket, payload);
+  } catch {
+    /* ignore */
+  }
+}
+
+function markUserSpeechStart(meta, source = 'uplink') {
+  if (!meta) return;
+  if (!meta.latency) resetTurnLatency(meta, 'init');
+
+  const L = meta.latency;
+  // Ignore duplicate starts during same open turn
+  if (L.userAudioStartAt && !L.turnCompleteAt && !L.firstModelAudioAt) {
+    L.lastUserAudioAt = Date.now();
+    return;
+  }
+
+  resetTurnLatency(meta, source);
+  meta.latency.userAudioStartAt = Date.now();
+  meta.latency.lastUserAudioAt = meta.latency.userAudioStartAt;
+  console.log(`[LATENCY][BE] turn#${meta.latency.turnId} USER question started (${source})`);
+  emitLatency(meta, 'user_audio_start', { detail: source });
+}
+
+function markUserAudioChunk(meta) {
+  if (!meta?.isActivated) return;
+  if (!meta.latency) resetTurnLatency(meta, 'init');
+  const L = meta.latency;
+  // Continuous PCM uplink includes silence — do NOT start turns from every chunk.
+  // Only refresh timestamp while a turn is already open.
+  if (L.userAudioStartAt && !L.turnCompleteAt) {
+    L.lastUserAudioAt = Date.now();
+  }
+}
+
+function markUserSpeechEnd(meta, source = 'client') {
+  if (!meta?.latency) return;
+  const L = meta.latency;
+  if (!L.userAudioStartAt) {
+    markUserSpeechStart(meta, `speech_end_implies_start:${source}`);
+  }
+  if (L.userSpeechEndAt) return;
+  L.userSpeechEndAt = Date.now();
+  console.log(`[LATENCY][BE] turn#${L.turnId} USER speech end (${source})`);
+  emitLatency(meta, 'user_speech_end', { detail: source });
+}
+
+function markFirstUserStt(meta, text) {
+  if (!meta?.latency) return;
+  const L = meta.latency;
+  if (!L.userAudioStartAt || L.turnCompleteAt) {
+    markUserSpeechStart(meta, 'first_stt');
+  }
+  if (L.firstUserSttAt) return;
+  L.firstUserSttAt = Date.now();
+  emitLatency(meta, 'first_user_stt', { detail: String(text || '').slice(0, 80) });
+}
+
+function markFirstModelAudio(meta) {
+  if (!meta?.latency) return;
+  const L = meta.latency;
+  if (L.firstModelAudioAt) return;
+  L.firstModelAudioAt = Date.now();
+  L.loggedFirstAudio = true;
+  emitLatency(meta, 'first_bot_audio');
+}
+
+function markFirstModelText(meta) {
+  if (!meta?.latency) return;
+  const L = meta.latency;
+  if (L.firstModelTextAt) return;
+  L.firstModelTextAt = Date.now();
+  emitLatency(meta, 'first_bot_text');
+}
+
+function markTurnCompleteLatency(meta) {
+  if (!meta?.latency) return;
+  const L = meta.latency;
+  if (L.loggedComplete) return;
+  L.turnCompleteAt = Date.now();
+  L.loggedComplete = true;
+  emitLatency(meta, 'turn_complete');
+}
+
 function normalizeModelId(model) {
   return String(model || '').replace(/^models\//, '');
 }
@@ -72,6 +211,9 @@ function createSessionMeta(socket, chatbot) {
     topicDispatchedThisTurn: false,
     leadDraft: { name: '', company: '', designation: '', phone: '', email: '' },
     leadFormShown: false,
+    leadDraftLocked: false,
+    cameraOpened: false,
+    leadSaveInFlight: false,
     topicCounts: {},
     isActivated: false,
     activatedAt: 0,
@@ -88,6 +230,19 @@ function createSessionMeta(socket, chatbot) {
     setupDone: false,
     geminiSession: null,
     model: null,
+    latency: {
+      turnId: 0,
+      reason: '',
+      userAudioStartAt: 0,
+      lastUserAudioAt: 0,
+      userSpeechEndAt: 0,
+      firstUserSttAt: 0,
+      firstModelAudioAt: 0,
+      firstModelTextAt: 0,
+      turnCompleteAt: 0,
+      loggedFirstAudio: false,
+      loggedComplete: false,
+    },
   };
 }
 
@@ -157,34 +312,73 @@ function leadLooksReady(draft) {
   return Boolean(name && (phone || email));
 }
 
-function mergeLeadDraft(meta, text, forceShow = false) {
+/** Short verbal confirmation while form is on screen */
+function isLeadConfirmYes(text) {
+  const t = String(text || '')
+    .toLowerCase()
+    .replace(/[^\w\s\u0600-\u06FF]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t || t.length > 72) return false;
+  if (/\b(nahi|nahin|no|nope|galat|wrong|incorrect|change|fix|mat)\b/i.test(t)) {
+    return false;
+  }
+  return /\b(yes|yeah|yep|yup|haan|han|haa|ha|sahi|theek|correct|confirm|ok|okay|bilkul)\b/i.test(t);
+}
+
+function mergeLeadDraft(meta, text, forceShow = false, { fromAssistant = false } = {}) {
+  // Card-locked / on-screen form: never let bot read-back corrupt fields
+  if (fromAssistant && (meta.leadDraftLocked || meta.leadFormShown)) return;
+
   const extracted = extractLeadDetails(text);
   if (!Object.keys(extracted).length && !forceShow) return;
 
   if (Object.keys(extracted).length) {
     meta.leadDraft = { ...meta.leadDraft, ...extracted };
+    // User corrected a locked card form — unlock so updates stick for submit
+    if (meta.leadDraftLocked && !fromAssistant) {
+      meta.leadDraftLocked = false;
+    }
   }
 
   const d = meta.leadDraft;
   if ((forceShow || leadLooksReady(d)) && !meta.leadFormShown) {
     meta.leadFormShown = true;
-    emitJson(meta.socket, { type: 'show_lead_form', data: { ...d } });
+    emitJson(meta.socket, { type: 'show_lead_form', data: { ...d }, editable: false });
     console.log('[live] Lead form shown', d);
   } else if (meta.leadFormShown && Object.keys(extracted).length) {
-    // Keep form updated as more fields arrive
-    emitJson(meta.socket, { type: 'show_lead_form', data: { ...d } });
+    emitJson(meta.socket, { type: 'show_lead_form', data: { ...d }, editable: false });
   }
 }
 
-function emitLeadForm(meta, data, { editable = false } = {}) {
+function emitLeadForm(meta, data, { editable = false, lock = false } = {}) {
   meta.leadFormShown = true;
   meta.leadDraft = { ...meta.leadDraft, ...(data || {}) };
+  if (lock) meta.leadDraftLocked = true;
   emitJson(meta.socket, {
     type: 'show_lead_form',
     data: { ...meta.leadDraft },
     editable,
   });
-  console.log('[live] Lead form emit', meta.leadDraft);
+  console.log('[live] Lead form emit', meta.leadDraft, lock ? '(locked)' : '');
+}
+
+function pickLeadFields(args, draft, preferDraft) {
+  const a = args || {};
+  const d = draft || {};
+  const pick = (key) => {
+    const fromArgs = String(a[key] || '').trim();
+    const fromDraft = String(d[key] || '').trim();
+    if (preferDraft && fromDraft) return fromDraft;
+    return fromArgs || fromDraft;
+  };
+  return {
+    name: pick('name'),
+    company: pick('company'),
+    designation: pick('designation'),
+    phone: pick('phone'),
+    email: pick('email'),
+  };
 }
 
 /**
@@ -271,11 +465,12 @@ function emitImageSync(meta, catalogImageId, options = {}) {
     ? pdfPool
     : (meta.catalog || []).filter((img) => img.pdfKey === target.pdfKey);
 
-  const slideIndex = Math.max(0, cluster.findIndex((img) => img.id === target.id));
-  const poolKey = `${target.pdfKey}:sec:${cluster.map((i) => i.id).join(',')}`;
+  const displayPool = meta.fullPdfPool.length ? meta.fullPdfPool : cluster;
+  const slideIndex = Math.max(0, displayPool.findIndex((img) => Number(img.id) === Number(target.id)));
+  const poolKey = `${target.pdfKey}:all`;
   const needEmitImages = meta.slideshowEmittedKey !== poolKey;
 
-  meta.currentSlideshow = cluster;
+  meta.currentSlideshow = displayPool;
   meta.pendingSlideshow = meta.fullPdfPool;
   meta.pendingPdfKey = target.pdfKey;
   meta.pendingPdfName = target.pdfName;
@@ -286,21 +481,20 @@ function emitImageSync(meta, catalogImageId, options = {}) {
     meta.slideshowEmittedKey = poolKey;
     emitJson(meta.socket, {
       type: 'images',
-      images: cluster.map(formatImageForFrontend),
+      images: displayPool.map(formatImageForFrontend),
       pdfName: target.pdfName,
       pdfKey: target.pdfKey,
       replace: true,
-      // Multi-image section → gentle carousel; single → no auto-advance needed
-      holdCarouselMs: cluster.length > 1 ? 4500 : 0,
-      autoAdvance: cluster.length > 1,
-      initialSlideIndex: slideIndex,
+      holdCarouselMs: 0,
+      autoAdvance: false,
+      initialSlideIndex: Math.max(0, slideIndex),
     });
   }
 
   emitJson(meta.socket, {
     type: 'image_sync',
     imageId: target.id,
-    slideIndex,
+    slideIndex: Math.max(0, slideIndex),
     timestamp: Date.now(),
   });
 
@@ -445,8 +639,14 @@ function parseAssistantMarkers(meta, chunkText) {
   const cameraMatch = buffer.match(/\[ACTIVATE_CAMERA\]/i);
   if (cameraMatch) {
     buffer = buffer.replace(cameraMatch[0], '');
-    emitJson(meta.socket, { type: 'activate_camera' });
-    emitJson(meta.socket, { type: 'transcript', role: 'assistant', text: '[ACTIVATE_CAMERA]' });
+    // One camera open per lead attempt — ignore repeat markers (stops photo spam)
+    if (!meta.cameraOpened && !meta.leadFormShown) {
+      meta.cameraOpened = true;
+      emitJson(meta.socket, { type: 'activate_camera' });
+      emitJson(meta.socket, { type: 'transcript', role: 'assistant', text: '[ACTIVATE_CAMERA]' });
+    } else {
+      console.log('[live] Ignoring duplicate [ACTIVATE_CAMERA]');
+    }
   }
 
   meta.assistantBuffer = buffer;
@@ -474,14 +674,18 @@ async function handleToolCall(toolCall, meta) {
 
   for (const call of calls) {
     if (call.name === 'submitLead') {
+      if (meta.leadSaveInFlight) {
+        responses.push({
+          id: call.id,
+          name: call.name,
+          response: { result: 'Lead save already in progress.', saved: false },
+        });
+        continue;
+      }
+
       const args = call.args || {};
-      const leadData = {
-        name: args.name || '',
-        company: args.company || '',
-        designation: args.designation || '',
-        phone: args.phone || '',
-        email: args.email || '',
-      };
+      // Prefer locked card draft so bot speech never corrupts email/phone
+      const leadData = pickLeadFields(args, meta.leadDraft, Boolean(meta.leadDraftLocked));
 
       // Never save silently — form must appear on screen for visitor to verify first
       if (!meta.leadFormShown) {
@@ -491,17 +695,20 @@ async function handleToolCall(toolCall, meta) {
           name: call.name,
           response: {
             result:
-              'Lead form is now on screen. Read the details aloud, ask the visitor to confirm. '
-              + 'Call submitLead again ONLY after they say yes / sahi hai.',
+              'Lead form is now on screen. Read Name, Company, Designation, Phone, Email once in the SAME voice. '
+              + 'Ask "Kya yeh details sahi hain?" Call submitLead again ONLY after they say yes — use the EXACT on-screen values.',
             formShown: true,
             saved: false,
+            fields: leadData,
           },
         });
         console.log('[live] submitLead blocked — form shown for confirmation first', leadData);
         continue;
       }
 
+      meta.leadSaveInFlight = true;
       try {
+        const t0 = Date.now();
         const lead = await saveLead({
           name: leadData.name,
           company: leadData.company,
@@ -529,11 +736,15 @@ async function handleToolCall(toolCall, meta) {
         responses.push({
           id: call.id,
           name: call.name,
-          response: { result: 'Lead saved successfully.', leadId: String(lead._id) },
+          response: {
+            result: 'Lead saved successfully. Say a brief thank-you in the SAME voice, then stop.',
+            leadId: String(lead._id),
+          },
         });
 
-        console.log(`[live] Lead saved: ${lead.name} | bot ${meta.chatbot.name}`);
+        console.log(`[live] Lead saved in ${Date.now() - t0}ms: ${lead.name} | bot ${meta.chatbot.name}`);
       } catch (err) {
+        meta.leadSaveInFlight = false;
         responses.push({
           id: call.id,
           name: call.name,
@@ -546,6 +757,9 @@ async function handleToolCall(toolCall, meta) {
   if (leadSaved) {
     meta.leadDraft = { name: '', company: '', designation: '', phone: '', email: '' };
     meta.leadFormShown = false;
+    meta.leadDraftLocked = false;
+    meta.cameraOpened = false;
+    meta.leadSaveInFlight = false;
     meta.currentSlideshow = [];
     meta.pendingSlideshow = null;
     meta.slideshowEmittedKey = null;
@@ -601,6 +815,28 @@ function flushUserTranscript(meta) {
 
   if (meta.isActivated) {
     mergeLeadDraft(meta, full);
+
+    // Fast path: visitor says yes while form is on screen → save immediately
+    if (
+      meta.leadFormShown
+      && !meta.leadSaveInFlight
+      && leadLooksReady(meta.leadDraft)
+      && isLeadConfirmYes(full)
+    ) {
+      console.log('[live] Verbal YES detected — auto submitLead');
+      handleToolCall(
+        {
+          functionCalls: [
+            {
+              id: `auto-yes-${Date.now()}`,
+              name: 'submitLead',
+              args: { ...meta.leadDraft },
+            },
+          ],
+        },
+        meta
+      ).catch((err) => console.error('[live] auto submitLead failed:', err.message));
+    }
   }
 
   meta.userUtteranceBuffer = '';
@@ -614,8 +850,8 @@ function flushAssistantTranscript(meta) {
   console.log(`[live] Bot said: "${full}"`);
   emitJson(meta.socket, { type: 'transcript', role: 'assistant', text: full, final: true });
 
-  // Bot often reads details aloud without emitting SHOW_LEAD_FORM — still show the form
-  mergeLeadDraft(meta, full);
+  // Never merge assistant speech into lead fields (read-back corrupts email/phone)
+  mergeLeadDraft(meta, full, false, { fromAssistant: true });
 }
 
 function cleanTranscriptNoise(text) {
@@ -679,18 +915,24 @@ function activateSession(meta, heard, { greet = false } = {}) {
 }
 
 function accumulateUserTranscript(meta, chunk) {
-  const cleaned = cleanTranscriptNoise(chunk);
-  if (!cleaned || isNoiseTranscript(cleaned)) return;
+  // Incremental STT often arrives 1–2 chars at a time — do not drop as "noise"
+  const cleaned = String(chunk || '')
+    .replace(/<noise>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return;
 
   meta.userStreamBuffer = appendTranscript(meta.userStreamBuffer, cleaned);
   meta.userUtteranceBuffer = meta.userStreamBuffer;
 
   if (!meta.isActivated) {
     console.log(`[live] STT (wake): "${meta.userStreamBuffer}"`);
+  } else {
+    markFirstUserStt(meta, cleaned);
   }
 
   if (!meta.isActivated && detectActivation(meta.userStreamBuffer, meta.chatbot)) {
-    // Prefer greet nudge so intro is never lost if pre-activate audio was dropped
     activateSession(meta, meta.userStreamBuffer, { greet: true });
   }
 }
@@ -747,12 +989,16 @@ function handleLiveMessage(meta, message) {
     meta.lastShownImageId = null;
     meta.lastSpeechSyncLen = 0;
     meta.deferredShowImageIds = [];
-    meta.userStreamBuffer = '';
+    // Never wipe user STT on interrupt — wake keyword lives in this buffer
+    if (meta.isActivated) {
+      meta.userStreamBuffer = '';
+    }
     meta.topicDispatchedThisTurn = false;
   }
 
-  if (sc.inputTranscription?.text) {
-    accumulateUserTranscript(meta, sc.inputTranscription.text.trim());
+  const sttText = sc.inputTranscription?.text;
+  if (sttText) {
+    accumulateUserTranscript(meta, String(sttText));
   }
 
   // Forward bot audio only while active + not suppressed.
@@ -769,12 +1015,14 @@ function handleLiveMessage(meta, message) {
         activateSession(meta, buf, { greet: true });
         if (!meta.isActivated) continue;
       }
+      markFirstModelAudio(meta);
       emitJson(meta.socket, { type: 'audio', data: inline.data, mimeType: inline.mimeType });
     }
   }
 
   if (sc.outputTranscription?.text) {
     if (meta.isActivated && !meta.suppressOutput) {
+      markFirstModelText(meta);
       parseAssistantMarkers(meta, sc.outputTranscription.text);
     } else {
       // Drop leftover model text while onboarding / after End Chat
@@ -785,6 +1033,7 @@ function handleLiveMessage(meta, message) {
   if (sc.turnComplete) {
     flushUserTranscript(meta);
     if (meta.isActivated && !meta.suppressOutput) {
+      markTurnCompleteLatency(meta);
       flushDeferredShowImages(meta, true);
       revalidateShownImage(meta);
       autoSyncImageFromSpeech(meta);
@@ -805,6 +1054,7 @@ function connectAndWaitForSetup(ai, model, liveConfig, meta) {
   let resolveSetup = null;
   let rejectSetup = null;
   let setupTimer = null;
+  let settled = false;
 
   const setupPromise = new Promise((resolve, reject) => {
     resolveSetup = resolve;
@@ -813,10 +1063,23 @@ function connectAndWaitForSetup(ai, model, liveConfig, meta) {
       reject(new Error(`Setup timed out for model ${model}`));
     }, 15000);
   });
+  // WS can fail before .then() attaches — avoid unhandledRejection crash
+  setupPromise.catch(() => {});
 
   const settle = (fn, value) => {
+    if (settled || typeof fn !== 'function') return;
+    settled = true;
     clearTimeout(setupTimer);
-    fn(value);
+    try {
+      fn(value);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const failSetup = (err) => {
+    const msg = formatGeminiErrorForUser(err);
+    settle(rejectSetup, err instanceof Error ? err : new Error(msg));
   };
 
   const callbacks = {
@@ -836,7 +1099,7 @@ function connectAndWaitForSetup(ai, model, liveConfig, meta) {
       const msg = formatGeminiErrorForUser(err);
       console.error(`[live] Gemini error (${model}):`, err?.message || msg);
       if (!meta.setupDone) {
-        settle(rejectSetup, new Error(msg));
+        failSetup(err);
       } else {
         emitJson(meta.socket, { type: 'error', message: msg });
       }
@@ -846,7 +1109,7 @@ function connectAndWaitForSetup(ai, model, liveConfig, meta) {
       if (!meta.setupDone) {
         const msg = reason || `Connection closed before setup (${model})`;
         console.warn(`[live] Closed before ready (${model}):`, msg);
-        settle(rejectSetup, new Error(msg));
+        failSetup(new Error(msg));
       } else {
         emitJson(meta.socket, { type: 'status', status: 'gemini_closed' });
       }
@@ -861,13 +1124,15 @@ function connectAndWaitForSetup(ai, model, liveConfig, meta) {
       return setupPromise.then(() => session);
     })
     .catch((err) => {
-      clearTimeout(setupTimer);
+      failSetup(err);
       try {
         meta.geminiSession?.close();
       } catch {
         /* ignore */
       }
-      throw err;
+      const wrapped = err instanceof Error ? err : new Error(formatGeminiErrorForUser(err));
+      if (!wrapped.message) wrapped.message = formatGeminiErrorForUser(err);
+      return Promise.reject(new Error(formatGeminiErrorForUser(err)));
     });
 }
 
@@ -887,7 +1152,8 @@ async function startGeminiLiveForSocket(socket, chatbot, knowledgeText) {
     speechConfig: {
       voiceConfig: {
         prebuiltVoiceConfig: {
-          voiceName: process.env.GEMINI_LIVE_VOICE || 'Alnilam',
+          // Lock one voice for the whole Live session (no mid-chat voice switch)
+          voiceName: process.env.GEMINI_LIVE_VOICE || 'Charon',
         },
       },
     },
@@ -896,13 +1162,13 @@ async function startGeminiLiveForSocket(socket, chatbot, knowledgeText) {
     inputAudioTranscription: {},
     outputAudioTranscription: {},
     realtimeInputConfig: {
-      // Hear user quickly; allow bot to finish long detailed answers
       activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
       automaticActivityDetection: {
+        // HIGH so wake words like "hello" actually produce inputTranscription
         startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
         endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
-        silenceDurationMs: 650,
-        prefixPaddingMs: 100,
+        silenceDurationMs: 900,
+        prefixPaddingMs: 120,
       },
     },
   };
@@ -954,6 +1220,10 @@ function sendLiveAudio(socketId, { data, mimeType }) {
     && Date.now() < entry.meta.ignoreWakeUntil
   ) {
     return false;
+  }
+
+  if (entry.meta.isActivated) {
+    markUserAudioChunk(entry.meta);
   }
 
   const count = (audioChunkCounts.get(socketId) || 0) + 1;
@@ -1032,13 +1302,8 @@ function handleWakeAttempt(socketId) {
 
   console.log(`[live] Wake attempt (socket ${socketId}) — waiting for STT keyword match`);
 
-  // Do NOT cut the stream instantly — give Gemini time to produce inputTranscription.
-  if (meta.wakeAudioEndTimer) clearTimeout(meta.wakeAudioEndTimer);
-  meta.wakeAudioEndTimer = setTimeout(() => {
-    meta.wakeAudioEndTimer = null;
-    if (!meta.isActivated) endLiveAudioStream(socketId);
-  }, 550);
-
+  // Keep the audio stream open. Cutting it at 550ms was producing empty STT
+  // ("hello" never landed in the transcript buffer).
   scheduleWakeActivation(meta);
 }
 
@@ -1046,10 +1311,27 @@ function handleWakeAttempt(socketId) {
 function handleUserSpeechEnd(socketId) {
   const entry = getSessionEntry(socketId);
   if (!entry?.geminiSession || !entry.meta) return;
-  if (entry.meta.isActivated) return;
+  if (entry.meta.isActivated) {
+    markUserSpeechEnd(entry.meta, 'live:audio_end_or_pause');
+    return;
+  }
   // Wake path owns audio_end timing
   if (entry.meta.wakePending) return;
   endLiveAudioStream(socketId);
+}
+
+/** Explicit client timing marks (speech start/end from mic VAD). */
+function handleClientLatencyMark(socketId, payload = {}) {
+  const entry = getSessionEntry(socketId);
+  if (!entry?.meta?.isActivated) return;
+  const phase = String(payload.phase || '');
+  if (phase === 'user_speech_start') {
+    markUserSpeechStart(entry.meta, 'frontend_vad_start');
+    return;
+  }
+  if (phase === 'user_speech_end') {
+    markUserSpeechEnd(entry.meta, 'frontend_vad_end');
+  }
 }
 
 function scheduleWakeActivation(meta) {
@@ -1075,8 +1357,8 @@ function scheduleWakeActivation(meta) {
 
   if (tryActivateFromStt()) return;
 
-  // Wait longer for STT — previous 1.4s window was too short (salam never matched).
-  const delays = [500, 1000, 1600, 2400, 3500];
+  // Wait for Gemini inputTranscription — "hello" often arrives after the pause.
+  const delays = [400, 800, 1400, 2200, 3500, 5000];
   let step = 0;
 
   const tick = () => {
@@ -1141,6 +1423,9 @@ function endLiveConversation(socketId) {
   meta.ignoreWakeUntil = Date.now() + 5000;
   meta.leadDraft = { name: '', company: '', designation: '', phone: '', email: '' };
   meta.leadFormShown = false;
+  meta.leadDraftLocked = false;
+  meta.cameraOpened = false;
+  meta.leadSaveInFlight = false;
   meta.currentSlideshow = [];
   meta.pendingSlideshow = null;
   meta.fullPdfPool = [];
@@ -1190,6 +1475,7 @@ module.exports = {
   endLiveAudioStream,
   handleUserSpeechEnd,
   handleWakeAttempt,
+  handleClientLatencyMark,
   endLiveConversation,
   stopGeminiLiveForSocket,
   liveSessions,

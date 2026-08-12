@@ -78,7 +78,31 @@ const chatbotSchema = new mongoose.Schema({
     createdBy: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User',
-        required: true
+        required: function requiredCreatedBy() {
+            return this.isDemo !== true;
+        }
+    },
+
+    isDemo: {
+        type: Boolean,
+        default: false,
+        index: true
+    },
+
+    demoCleanupTokenHash: {
+        type: String,
+        default: null,
+        select: false
+    },
+
+    demoLastSeenAt: {
+        type: Date,
+        default: null
+    },
+
+    demoDisconnectedAt: {
+        type: Date,
+        default: null
     },
 
     isActive: {

@@ -70,7 +70,13 @@ function formatGeminiErrorForUser(error) {
     return 'Gemini API quota exceeded. Please wait a few minutes, switch GOOGLE_API_KEY in backend .env, or use GEMINI_MODEL=gemini-1.5-flash with billing enabled at https://aistudio.google.com';
   }
 
-  const msg = error?.message || 'Gemini request failed';
+  const msg = String(error?.message || error || 'Gemini request failed');
+  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(msg)) {
+    return 'Cannot reach Gemini (DNS/network). Check internet, DNS, or VPN, then retry.';
+  }
+  if (/ENETUNREACH|ECONNREFUSED|ETIMEDOUT|ECONNRESET/i.test(msg)) {
+    return 'Cannot reach Gemini (network error). Check internet and try again.';
+  }
   if (msg.length > 200) {
     return msg.slice(0, 200) + '…';
   }

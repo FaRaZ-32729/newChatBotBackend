@@ -11,6 +11,7 @@ const {
   endLiveAudioStream,
   handleUserSpeechEnd,
   handleWakeAttempt,
+  handleClientLatencyMark,
   stopGeminiLiveForSocket,
   mergeLeadDraft,
   emitLeadForm,
@@ -86,16 +87,38 @@ function registerLiveSocketHandlers(io) {
       handleWakeAttempt(socket.id);
     });
 
+    socket.on('live:latency_mark', (payload) => {
+      handleClientLatencyMark(socket.id, payload || {});
+    });
+
     socket.on('live:text', (payload) => {
       const { text } = payload || {};
       if (!text?.trim()) return;
 
       const entry = getSessionEntry(socket.id);
+      const trimmed = text.trim();
+
       if (entry?.meta) {
-        mergeLeadDraft(entry.meta, text);
+        if (/\[CARD_SCANNED\]/i.test(trimmed)) {
+          try {
+            const m = trimmed.match(/Extracted Data:\s*(\{[\s\S]*?\})\s*(?:\n|$)/i);
+            if (m) {
+              const lead = JSON.parse(m[1]);
+              entry.meta.cameraOpened = true;
+              emitLeadForm(entry.meta, lead, { editable: false, lock: true });
+            }
+          } catch (err) {
+            console.warn('[live] CARD_SCANNED parse failed:', err.message);
+          }
+        } else if (/\[CARD_SCAN_FAILED\]/i.test(trimmed)) {
+          entry.meta.cameraOpened = false;
+          entry.meta.leadDraftLocked = false;
+        } else if (!/\[ACTIVATE_CAMERA\]/i.test(trimmed)) {
+          mergeLeadDraft(entry.meta, trimmed);
+        }
       }
 
-      sendLiveText(socket.id, text.trim());
+      sendLiveText(socket.id, trimmed);
     });
 
     socket.on('live:inactivity_check', () => {
@@ -134,13 +157,13 @@ function registerLiveSocketHandlers(io) {
 
         const entry = getSessionEntry(socket.id);
         if (entry?.meta) {
-          emitLeadForm(entry.meta, lead, { editable: true });
+          entry.meta.cameraOpened = true;
+          emitLeadForm(entry.meta, lead, { editable: false, lock: true });
         }
 
         const cardMessage = `[CARD_SCANNED]
-Raw Text: ${extracted.rawText || extracted.displayText || ''}
 Extracted Data: ${JSON.stringify(lead)}
-Form is on screen. Read the details aloud and ask the visitor to confirm. On YES call submitLead.`;
+Form is on screen. Read Name, Company, Designation, Phone, Email once in the SAME voice. Ask "Kya yeh details sahi hain?" On YES call submitLead with these EXACT fields. On NO ask what to fix — do not open camera again.`;
 
         sendLiveText(socket.id, cardMessage);
 
