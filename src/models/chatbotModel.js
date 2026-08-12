@@ -105,6 +105,17 @@ const chatbotSchema = new mongoose.Schema({
         default: null
     },
 
+    demoStatus: {
+        type: String,
+        enum: ['ready', 'processing', 'failed'],
+        default: 'ready',
+    },
+
+    demoError: {
+        type: String,
+        default: null,
+    },
+
     isActive: {
         type: Boolean,
         default: true

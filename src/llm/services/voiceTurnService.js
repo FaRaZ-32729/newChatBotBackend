@@ -40,6 +40,24 @@ async function loadChatbotForVoice(chatbotId, user = null) {
     return { error: { code: 'NOT_FOUND', message: 'Chatbot not found or inactive' } };
   }
 
+  if (chatbot.isDemo === true && chatbot.demoStatus === 'processing') {
+    return {
+      error: {
+        code: 'PROCESSING',
+        message: 'Demo is still preparing your document. Please wait a moment.',
+      },
+    };
+  }
+
+  if (chatbot.isDemo === true && chatbot.demoStatus === 'failed') {
+    return {
+      error: {
+        code: 'FAILED',
+        message: chatbot.demoError || 'Demo processing failed. Please try again with a smaller PDF.',
+      },
+    };
+  }
+
   if (user && !canAccessChatbot(user, chatbot)) {
     return { error: { code: 'FORBIDDEN', message: 'You do not have access to this chatbot' } };
   }

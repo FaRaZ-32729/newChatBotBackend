@@ -3,6 +3,7 @@ const router = express.Router();
 const {
   createChatbot,
   createDemoChatbot,
+  getDemoChatbotStatus,
   heartbeatDemoChatbot,
   disconnectDemoChatbot,
   updateChatbot,
@@ -14,6 +15,7 @@ const authenticate = require('../middlewares/auth');
 
 router.post('/create', authenticate, createChatbot);
 router.post('/demo', createDemoChatbot);
+router.get('/demo/:id/status', getDemoChatbotStatus);
 router.post('/demo/:id/heartbeat', heartbeatDemoChatbot);
 router.post('/demo/:id/disconnect', disconnectDemoChatbot);
 router.put('/update/:id', authenticate, updateChatbot);

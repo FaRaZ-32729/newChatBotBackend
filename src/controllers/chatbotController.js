@@ -394,6 +394,60 @@ const DEMO_INSTRUCTIONS =
     + 'Be warm, clear, and helpful. Match the visitor language (English, Urdu, or Roman Urdu). '
     + 'Do not invent facts that are not in the document.';
 
+const DEMO_MAX_PDF_BYTES = 12 * 1024 * 1024;
+const DEMO_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+async function finishDemoProcessing(chatbotId, folderName, pdfFilePath, pdfOriginalName) {
+    try {
+        const chatbot = await ChatbotModel.findById(chatbotId);
+        if (!chatbot || chatbot.isDemo !== true) return;
+
+        const pdfNameClean = String(pdfOriginalName || '')
+            .replace(/\.pdf$/i, '')
+            .replace(/[^a-zA-Z0-9]/g, '_');
+
+        console.log(`[demo] Extracting images for ${chatbotId}…`);
+        const extractedImages = await processPDFImages(pdfFilePath, folderName, pdfNameClean);
+
+        const pdfs = Array.isArray(chatbot.knowledgeBasePdfs) ? [...chatbot.knowledgeBasePdfs] : [];
+        if (!pdfs.length) {
+            chatbot.demoStatus = 'failed';
+            chatbot.demoError = 'Demo PDF is missing after upload';
+            await chatbot.save();
+            return;
+        }
+
+        pdfs[0] = {
+            ...(typeof pdfs[0].toObject === 'function' ? pdfs[0].toObject() : pdfs[0]),
+            extractedImages,
+        };
+        chatbot.knowledgeBasePdfs = pdfs;
+        chatbot.demoStatus = 'ready';
+        chatbot.demoError = null;
+        chatbot.markModified('knowledgeBasePdfs');
+        await chatbot.save();
+
+        try {
+            const { getChatbotKnowledge } = require('../llm/services/knowledgeService');
+            await getChatbotKnowledge(chatbot);
+        } catch (cacheErr) {
+            console.error('[demo] knowledge cache warm-up failed:', cacheErr.message);
+        }
+
+        console.log(`[demo] Ready ${chatbotId} — ${extractedImages.length} image(s)`);
+    } catch (err) {
+        console.error(`[demo] Background processing failed for ${chatbotId}:`, err.message);
+        try {
+            await ChatbotModel.findByIdAndUpdate(chatbotId, {
+                demoStatus: 'failed',
+                demoError: err.message || 'Failed to process demo PDF',
+            });
+        } catch {
+            /* ignore */
+        }
+    }
+}
+
 const createDemoChatbot = async (req, res) => {
     const folderName = `demo_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     req.uploadFolderName = folderName;
@@ -428,59 +482,77 @@ const createDemoChatbot = async (req, res) => {
                 });
             }
 
+            if (onboardingFile.size > DEMO_MAX_IMAGE_BYTES) {
+                cleanupChatbotUploads(createdFolders, req.files || []);
+                return res.status(400).json({
+                    success: false,
+                    message: 'Image is too large for demo. Please use an image under 5 MB.',
+                });
+            }
+
             const pdfFile = pdfFiles[0];
-            const pdfNameClean = pdfFile.originalname.replace(/\.pdf$/i, '').replace(/[^a-zA-Z0-9]/g, '_');
-            const extractedImages = await processPDFImages(pdfFile.path, folderName, pdfNameClean);
+            if (pdfFile.size > DEMO_MAX_PDF_BYTES) {
+                cleanupChatbotUploads(createdFolders, req.files || []);
+                return res.status(400).json({
+                    success: false,
+                    message: 'PDF is too large for demo. Please use a PDF under 12 MB.',
+                });
+            }
 
-            const knowledgeBasePdfs = [{
-                name: pdfFile.originalname,
-                url: `/uploads/chatbots/${folderName}/${pdfFile.filename}`,
-                size: `${(pdfFile.size / (1024 * 1024)).toFixed(2)} MB`,
-                extractedImages,
-            }];
-
+            // Respond immediately after upload — PDF extract runs in background
+            // (avoids Hostinger/nginx HTTP2 idle timeout).
             const demoToken = crypto.randomBytes(24).toString('hex');
             const saved = await ChatbotModel.create({
                 name,
                 onboardingImage: `/uploads/chatbots/${folderName}/${onboardingFile.filename}`,
-                knowledgeBasePdfs,
+                knowledgeBasePdfs: [{
+                    name: pdfFile.originalname,
+                    url: `/uploads/chatbots/${folderName}/${pdfFile.filename}`,
+                    size: `${(pdfFile.size / (1024 * 1024)).toFixed(2)} MB`,
+                    extractedImages: [],
+                }],
                 activationKey: 'hello',
                 specificInstructions: DEMO_INSTRUCTIONS,
                 scanCardRequired: false,
                 isDemo: true,
+                demoStatus: 'processing',
+                demoError: null,
                 demoCleanupTokenHash: hashDemoToken(demoToken),
                 demoLastSeenAt: new Date(),
                 demoDisconnectedAt: null,
-            });
-
-            setImmediate(async () => {
-                try {
-                    const { getChatbotKnowledge } = require('../llm/services/knowledgeService');
-                    await getChatbotKnowledge(saved);
-                } catch (cacheErr) {
-                    console.error('[demo] knowledge cache warm-up failed:', cacheErr.message);
-                }
             });
 
             startDemoChatbotSweep();
 
             res.status(201).json({
                 success: true,
-                message: 'Demo chatbot created',
+                message: 'Demo uploaded — processing document…',
                 data: {
                     _id: saved._id,
                     name: saved.name,
                     activationKey: saved.activationKey,
                     isDemo: true,
+                    demoStatus: 'processing',
                 },
                 demoToken,
+            });
+
+            setImmediate(() => {
+                finishDemoProcessing(
+                    saved._id,
+                    folderName,
+                    pdfFile.path,
+                    pdfFile.originalname
+                ).catch((e) => console.error('[demo] finish error:', e.message));
             });
         } catch (error) {
             console.error('Create Demo Chatbot Error:', error);
             cleanupChatbotUploads(createdFolders, req.files || []);
             const message = error.message || 'Failed to create demo chatbot';
             const status = /extraction failed/i.test(message) ? 422 : 500;
-            res.status(status).json({ success: false, message });
+            if (!res.headersSent) {
+                res.status(status).json({ success: false, message });
+            }
         }
     });
 };
@@ -491,6 +563,30 @@ async function findDemoByToken(id, token) {
     if (!demoTokensMatch(chatbot.demoCleanupTokenHash, token)) return null;
     return chatbot;
 }
+
+const getDemoChatbotStatus = async (req, res) => {
+    try {
+        const chatbot = await findDemoByToken(req.params.id, readDemoToken(req));
+        if (!chatbot) {
+            return res.status(404).json({ success: false, message: 'Demo chatbot not found' });
+        }
+
+        res.status(200).json({
+            success: true,
+            data: {
+                _id: chatbot._id,
+                name: chatbot.name,
+                demoStatus: chatbot.demoStatus || 'ready',
+                demoError: chatbot.demoError || null,
+                activationKey: chatbot.activationKey || 'hello',
+                isDemo: true,
+            },
+        });
+    } catch (error) {
+        console.error('Demo status error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+};
 
 const heartbeatDemoChatbot = async (req, res) => {
     try {
@@ -817,10 +913,34 @@ const updateChatbot = async (req, res) => {
 const getPublicChatbot = async (req, res) => {
     try {
         const { id } = req.params;
-        const chatbot = await ChatbotModel.findById(id).select('name onboardingImage isActive activationKey isDemo');
+        const chatbot = await ChatbotModel.findById(id).select(
+            'name onboardingImage isActive activationKey isDemo demoStatus demoError'
+        );
 
         if (!chatbot || chatbot.isActive === false) {
             return res.status(404).json({ success: false, message: 'Chatbot not found or inactive' });
+        }
+
+        if (chatbot.isDemo === true && chatbot.demoStatus === 'failed') {
+            return res.status(422).json({
+                success: false,
+                message: chatbot.demoError || 'Demo processing failed',
+            });
+        }
+
+        if (chatbot.isDemo === true && chatbot.demoStatus === 'processing') {
+            return res.status(202).json({
+                success: true,
+                message: 'Demo is still processing',
+                data: {
+                    _id: chatbot._id,
+                    name: chatbot.name,
+                    onboardingImage: chatbot.onboardingImage,
+                    activationKey: chatbot.activationKey || '',
+                    isDemo: true,
+                    demoStatus: 'processing',
+                },
+            });
         }
 
         res.status(200).json({
@@ -831,6 +951,7 @@ const getPublicChatbot = async (req, res) => {
                 onboardingImage: chatbot.onboardingImage,
                 activationKey: chatbot.activationKey || '',
                 isDemo: chatbot.isDemo === true,
+                demoStatus: chatbot.demoStatus || 'ready',
             },
         });
     } catch (error) {
@@ -842,6 +963,7 @@ const getPublicChatbot = async (req, res) => {
 module.exports = {
     createChatbot,
     createDemoChatbot,
+    getDemoChatbotStatus,
     heartbeatDemoChatbot,
     disconnectDemoChatbot,
     startDemoChatbotSweep,
