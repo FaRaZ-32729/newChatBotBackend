@@ -14,6 +14,7 @@ function getAllowedOrigins() {
     'http://127.0.0.1:5173',
     'https://iotfiy-virtual-asistant.vercel.app',
     'https://iotfiy-ecosystem.vercel.app',
+    'https://intelliq.iotfiysolutions.com',
   ].filter(Boolean);
 
   return [...new Set([...defaults, ...fromEnv])];
