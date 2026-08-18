@@ -1,6 +1,17 @@
 /**
  * Gemini API helpers — retry on rate limit + try fallback models.
  */
+function isRetiredModelError(error) {
+  const msg = String(error?.message || error || '').toLowerCase();
+  const status = error?.status;
+  return (
+    status === 404
+    || msg.includes('404')
+    || msg.includes('is not found')
+    || msg.includes('not supported for generatecontent')
+  );
+}
+
 function isQuotaOrRateLimitError(error) {
   const msg = String(error?.message || error || '').toLowerCase();
   const status = error?.status;
@@ -51,8 +62,10 @@ async function withModelFallback(models, runWithModel) {
       return await withRetry(() => runWithModel(model));
     } catch (error) {
       lastError = error;
-      if (isQuotaOrRateLimitError(error)) {
-        console.warn(`[gemini] Quota/rate limit on model "${model}" — trying next model…`);
+      if (isQuotaOrRateLimitError(error) || isRetiredModelError(error)) {
+        console.warn(
+          `[gemini] Model "${model}" unavailable (${isRetiredModelError(error) ? 'not found' : 'quota'}) — trying next…`
+        );
         continue;
       }
       throw error;
@@ -67,7 +80,7 @@ async function withModelFallback(models, runWithModel) {
  */
 function formatGeminiErrorForUser(error) {
   if (isQuotaOrRateLimitError(error)) {
-    return 'Gemini API quota exceeded. Please wait a few minutes, switch GOOGLE_API_KEY in backend .env, or use GEMINI_MODEL=gemini-1.5-flash with billing enabled at https://aistudio.google.com';
+    return 'Gemini API quota exceeded. Please wait a few minutes or switch GOOGLE_API_KEY in backend .env.';
   }
 
   const msg = String(error?.message || error || 'Gemini request failed');
@@ -85,6 +98,7 @@ function formatGeminiErrorForUser(error) {
 
 module.exports = {
   isQuotaOrRateLimitError,
+  isRetiredModelError,
   withRetry,
   withModelFallback,
   formatGeminiErrorForUser,

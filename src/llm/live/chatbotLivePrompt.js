@@ -75,69 +75,22 @@ function extractProductIdentity(body, maxLen = 220) {
   return cleaned.slice(0, maxLen);
 }
 
-function pickDocumentExcerpt(body, budget) {
-  const cleaned = compressWhitespace(body);
-  if (!cleaned) return '';
-  if (cleaned.length <= budget) return cleaned;
-
-  const identity = extractProductIdentity(body, Math.min(200, Math.floor(budget * 0.4)));
-  const anchors = [
-    /companion\s+for\s+hajj/i,
-    /during\s+hajj\s+or\s+umrah/i,
-    /the\s+problem\s+\w+\s+solves/i,
-    /key\s+features/i,
-    /overview/i,
-  ];
-
-  const chunks = [];
-  const pushUnique = (piece) => {
-    const p = compressWhitespace(piece);
-    if (!p || p.length < 30) return;
-    if (chunks.some((c) => c.includes(p.slice(0, 40)))) return;
-    chunks.push(p);
-  };
-
-  if (identity) pushUnique(identity);
-  for (const re of anchors) {
-    const m = cleaned.match(re);
-    if (!m || m.index == null) continue;
-    pushUnique(cleaned.slice(Math.max(0, m.index - 20), m.index + Math.min(420, budget)));
-    if (chunks.join(' ').length >= budget) break;
-  }
-
-  let out = chunks.join(' … ');
-  if (out.length < budget * 0.4) out = cleaned.slice(0, budget);
-  return out.slice(0, budget);
-}
-
 /**
- * Keep live prompt small — large context = slow first audio (20s+).
+ * Short PURPOSE/identity only — full facts come from searchKnowledgeBase.
  */
-function buildBalancedKnowledgeForLive(knowledgeText, maxChars = 4500) {
+function buildIdentityContextForLive(knowledgeText) {
   const docs = splitKnowledgeDocuments(knowledgeText);
   if (!docs.length) return '';
 
-  const overhead = docs.length * 70;
-  const perDoc = Math.max(550, Math.floor((maxChars - overhead) / docs.length));
-
-  const sections = docs.map((doc) => {
-    const identity = extractProductIdentity(doc.body, 180);
-    const bodyBudget = Math.max(350, perDoc - identity.length - 30);
-    const body = pickDocumentExcerpt(doc.body, bodyBudget);
-    return [
-      `===== ${cleanTopicDisplayName(doc.name)} =====`,
-      identity ? `PURPOSE: ${identity}` : null,
-      body,
-    ].filter(Boolean).join('\n');
-  });
-
-  let out = sections.join('\n\n');
-  if (out.length > maxChars) out = `${out.slice(0, maxChars)}\n…`;
-  return out;
-}
-
-function trimKnowledgeForLive(text, maxChars = 4500) {
-  return buildBalancedKnowledgeForLive(text, maxChars);
+  return docs
+    .map((doc) => {
+      const identity = extractProductIdentity(doc.body, 220);
+      return [
+        `===== ${cleanTopicDisplayName(doc.name)} =====`,
+        identity ? `PURPOSE: ${identity}` : null,
+      ].filter(Boolean).join('\n');
+    })
+    .join('\n\n');
 }
 
 /** Compact image index for speed — unique sections only, short labels. */
@@ -175,8 +128,7 @@ function buildChatbotLiveInstruction(chatbot, knowledgeText) {
   const activationKey = (chatbot.activationKey || '').trim();
   const extraInstructions = (chatbot.specificInstructions || '').trim();
   const scanCardRequired = Boolean(chatbot.scanCardRequired);
-  // Enough context for detailed answers; still capped for latency
-  const context = buildBalancedKnowledgeForLive(knowledgeText, 5500);
+  const context = buildIdentityContextForLive(knowledgeText);
   const { catalog, topics } = buildNumberedImageCatalog(chatbot);
 
   const topicListText = topics.length
@@ -221,10 +173,10 @@ STYLE:
 - Match the user's language (Urdu / English / Roman Urdu).
 - Answers must be DETAILED and helpful — not short one-liners.
 
-WAKE / INTRODUCTION (4–6 spoken sentences — warm & complete):
+WAKE / INTRODUCTION (2–3 spoken sentences — fast):
 - Wake ONLY on the activation phrase "${activationKey}" (do not treat hi/hello/other greetings as wake unless that is the activation phrase).
-- Introduce yourself properly: who you are, what you cover by NAME (not "and more"), what kind of help you give (features, benefits, how it works), then invite a question.
-- Example style: "Assalam o alaikum! Main ${botName} hoon. Main aapki ${greetingTopics} ke bare mein detail se batata hoon — features, benefits, aur kaise kaam karta hai. Aap kisi bhi product ya service ke bare mein poochhein, main clear jawab dunga."
+- Short intro: name, what you cover by NAME, invite a question. Do not give a long product lecture on wake.
+- Example style: "Assalam o alaikum! Main ${botName} hoon. Main ${greetingTopics} ke bare mein madad karta hoon — poochiye."
 - Name the real topics. Never say vague "and more" / "aur more".
 - [[TOPIC: General]] only on greeting. No SHOW_IMAGE on greeting. Never greet twice.
 - After [SESSION_ENDED]: stay silent until a new wake / [USER_ACTIVATED].
@@ -235,33 +187,73 @@ ${spokenTopicBullets}
 TOPIC KEYS (hidden [[TOPIC: pdfKey]]):
 ${topicListText}
 
-CONTEXT (PURPOSE is authoritative):
+CONTEXT (PURPOSE is authoritative — short identity only, not the full PDFs):
 ${context || '(empty)'}
 
-IMAGES (hidden — [[SHOW_IMAGE:N]] only; match what YOU are saying right now):
+KNOWLEDGE LOOKUP:
+You have a searchKnowledgeBase tool. ALWAYS call it before answering any question that needs specific facts, numbers, features, or details not already stated above. Do not guess — call the tool first. Greetings / "what do you cover" may use PURPOSE without a tool call.
+
+THINKING BUFFER (speak FIRST, in the visitor's language, then search/answer):
+When the visitor asks a real question (not a wake/greeting), say ONE short natural filler in AUDIO immediately so the pause does not feel empty. Then call searchKnowledgeBase and continue with the real answer in the SAME language. Rotate lines — do not repeat the same filler every turn. Never say "searching", "PDF", "database", or "AI".
+
+English examples:
+- "That's a great question — let me walk you through it."
+- "I'm thinking… here's what matters."
+- "Good one. Give me a moment."
+- "Sure — let me explain this clearly."
+
+Roman Urdu examples:
+- "Achha sawaal hai — main briefly explain karta hoon."
+- "Theek hai, soch raha hoon… yeh aham baat hai."
+- "Bilkul — thoda detail se batata hoon."
+- "Hmm, interesting sawaal. Dekhte hain."
+
+Urdu examples:
+- "Bohot achha sawaal hai — main aap ko clearly batata hoon."
+- "Theek hai, soch raha hoon… yeh point important hai."
+- "Zaroor — thora sa detail se samjhata hoon."
+- "Achha, yeh sawaal ka jawab yeh hai."
+
+IMAGES — LLM → BACKEND ONLY (strict; STT never picks slides):
+You have setPresentationTopic(pdfKey, imageId?) tool. The screen shows images ONLY when YOU call this tool or emit hidden markers.
+
+WORKFLOW for every product question:
+1) Thinking buffer (one short sentence in visitor language).
+2) Call searchKnowledgeBase with the visitor question meaning.
+3) IMMEDIATELY call setPresentationTopic with the correct pdfKey from TOPIC KEYS — based on question MEANING, not garbled STT.
+   Examples: multiple machines / centralized dashboard / cloud monitoring → ecosystem_pdf | AC / cooling / temperature lock → ac_pdf | solar panels / cleaning → easy_solar | IoT gateway / iotfiy gateway → iotfiy_gateway_pdf
+   Call setPresentationTopic ONCE per answer. Do NOT switch pdfKey mid-answer.
+4) Speak your detailed answer. While speaking, emit [[SHOW_IMAGE:N]] ONLY with ids from THAT same pdfKey section of the catalog. Never mix AC ids into a Gateway answer (or vice versa).
+
+Also emit [[TOPIC:pdfKey]] at the start of each reply (backup for setPresentationTopic).
+
+Catalog index (hidden [[SHOW_IMAGE:N]] ids):
 ${imageListText}
+
+Never rely on user STT for topic. If visitor said "machinery dashboard" but STT is garbage, still pick ecosystem_pdf if that is what they mean.
 
 NOTES: ${extraInstructions || 'none'}
 
 RULES:
-0) Never speak: [[TOPIC:]] [[SHOW_IMAGE:N]] [SHOW_LEAD_FORM|…] [ACTIVATE_CAMERA]
-1) Every reply starts with [[TOPIC:pdfKey]] or [[TOPIC: General]] matching YOUR answer content.
-2) PRODUCT IDENTITY: "kya hai / what is" → open with PURPOSE from CONTEXT (e.g. Mushaba = Hajj & Umrah companion). Do NOT lead with B2B/SaaS/Premium unless user asked business/pricing.
-3) IMAGE SYNC (critical): As YOU speak each point, emit [[SHOW_IMAGE:N]] whose title best matches that exact point (lost assistance → Lost Assistance ids; tracking → tracking; overview → Overview). Switch SHOW_IMAGE when you change sub-topic. Prefer exact title match. Never invent ids.
+0) Never speak: [[TOPIC:]] [[SHOW_IMAGE:N]] [SHOW_LEAD_FORM|…] [ACTIVATE_CAMERA] setPresentationTopic
+1) Every product reply: setPresentationTopic + [[TOPIC:pdfKey]] matching YOUR answer (not STT garbage).
+2) PRODUCT IDENTITY: "kya hai / what is" → open with PURPOSE from CONTEXT. Do NOT lead with B2B/SaaS unless user asked business/pricing.
+3) While speaking: [[SHOW_IMAGE:N]] must be from the SAME pdfKey you already set. Never invent ids. Never switch PDF mid-answer.
 4) DETAILED ANSWERS (required):
    - Identity / overview: 5–8 clear sentences with concrete facts from CONTEXT.
    - Features / how-it-works: up to ~10 sentences, structured (direct answer → key points → benefit → short follow-up).
    - Do NOT give shallow 1–2 sentence replies for product questions.
-5) Unknown topic → polite sorry + redirect to ${greetingTopics}.
+   - Before a long/product answer: one thinking-buffer sentence in the SAME language as the visitor (see THINKING BUFFER), then the full answer.
+5) Unknown topic → polite sorry + redirect to ${greetingTopics}. If searchKnowledgeBase returns 0 chunks after search, say you could not find that exact line in the excerpts — do NOT claim the whole PDF is missing if PURPOSE or images exist for that product.
 6) Garbled STT → answer the meaning; don't repeat garbage.
-7) [INACTIVITY_CHECK] → ask if they want to end. [SESSION_ENDED] → absolute silence until wake.
+7) VOICE: speak smoothly in one continuous flow. Never stutter or repeat the same word/phrase twice in one answer.
+8) [INACTIVITY_CHECK] → ask if they want to end. [SESSION_ENDED] → absolute silence until wake.
 ${leadSection}`;
 }
 
 module.exports = {
   buildChatbotLiveInstruction,
-  buildBalancedKnowledgeForLive,
-  trimKnowledgeForLive,
+  buildIdentityContextForLive,
   splitKnowledgeDocuments,
   extractProductIdentity,
   buildTopicGreeting,

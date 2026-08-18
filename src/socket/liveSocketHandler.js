@@ -13,6 +13,7 @@ const {
   handleWakeAttempt,
   handleClientLatencyMark,
   stopGeminiLiveForSocket,
+  scheduleDelayedStopGemini,
   mergeLeadDraft,
   emitLeadForm,
   getSessionEntry,
@@ -26,6 +27,7 @@ function registerLiveSocketHandlers(io) {
     const user = socket.data.user;
 
     socket.on('live:start', async (payload, ack) => {
+      const t0 = Date.now();
       try {
         const { chatbotId } = payload || {};
         if (!chatbotId) {
@@ -41,8 +43,17 @@ function registerLiveSocketHandlers(io) {
           `[live] Starting for bot "${chatbot.name}" (${chatbotId}) `
           + `| activationKey="${chatbot.activationKey || ''}"`
         );
-        const knowledgeText = await getChatbotKnowledge(chatbot);
-        const { model } = await startGeminiLiveForSocket(socket, chatbot, knowledgeText);
+        const tLive = Date.now();
+        const { model, reused } = await startGeminiLiveForSocket(socket, chatbot, async () => {
+          const tKnow = Date.now();
+          const knowledgeText = await getChatbotKnowledge(chatbot);
+          console.log(`[LATENCY][BE] knowledge ready in ${Date.now() - tKnow}ms`);
+          return knowledgeText;
+        });
+        console.log(
+          `[LATENCY][BE] Gemini Live ${reused ? 'reused' : 'connected'} in ${Date.now() - tLive}ms`
+          + ` | total start ${Date.now() - t0}ms`
+        );
 
         socket.data.liveChatbotId = String(chatbotId);
 
@@ -54,6 +65,7 @@ function registerLiveSocketHandlers(io) {
             activationKey: chatbot.activationKey,
             scanCardRequired: Boolean(chatbot.scanCardRequired),
             model,
+            startMs: Date.now() - t0,
           },
         });
       } catch (err) {
@@ -74,17 +86,19 @@ function registerLiveSocketHandlers(io) {
     });
 
     socket.on('live:audio', (payload) => {
-      const { data, mimeType } = payload || {};
+      const { data, mimeType, clientT } = payload || {};
       if (!data) return;
-      sendLiveAudio(socket.id, { data, mimeType });
+      sendLiveAudio(socket.id, { data, mimeType, clientT });
     });
 
     socket.on('live:audio_end', () => {
       handleUserSpeechEnd(socket.id);
     });
 
-    socket.on('live:wake', () => {
-      handleWakeAttempt(socket.id);
+    socket.on('live:wake', (payload) => {
+      Promise.resolve(handleWakeAttempt(socket.id, payload || {})).catch((err) => {
+        console.error('[live] wake handler error:', err.message);
+      });
     });
 
     socket.on('live:latency_mark', (payload) => {
@@ -187,8 +201,8 @@ Form is on screen. Read Name, Company, Designation, Phone, Email once in the SAM
       ack?.({ success: true });
     });
 
-    socket.on('disconnect', async () => {
-      await stopGeminiLiveForSocket(socket.id);
+    socket.on('disconnect', () => {
+      scheduleDelayedStopGemini(socket.id, 8000);
     });
   });
 }

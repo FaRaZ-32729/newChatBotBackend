@@ -135,29 +135,64 @@ async function buildKnowledgeFromPdfs(chatbot) {
   return full;
 }
 
-/**
- * Get knowledge for a chatbot.
- * Uses cached text on the DB document when present; otherwise extracts and saves it.
- */
-async function getChatbotKnowledge(chatbot) {
-  if (chatbot.knowledgeTextCache && chatbot.knowledgeTextCache.trim()) {
-    console.log(`[knowledge] Using cached knowledge for bot "${chatbot.name}" (${chatbot.knowledgeTextCache.length} chars)`);
-    return chatbot.knowledgeTextCache;
-  }
-
-  console.log(`[knowledge] Building knowledge cache for bot "${chatbot.name}"…`);
-  const knowledge = await buildKnowledgeFromPdfs(chatbot);
-
-  // Save cache so the next caller (another user on same bot) is fast
+async function persistKnowledgeCache(chatbot, knowledge) {
   try {
     await ChatbotModel.findByIdAndUpdate(chatbot._id, {
       knowledgeTextCache: knowledge,
       knowledgeCachedAt: new Date(),
     });
+    chatbot.knowledgeTextCache = knowledge;
+    chatbot.knowledgeCachedAt = new Date();
   } catch (error) {
     console.error('[knowledge] Failed to save knowledge cache:', error.message);
   }
+}
 
+const chunkBuildInflight = new Map();
+
+async function ensureKnowledgeChunks(chatbot) {
+  if (!chatbot?._id || chatbot.knowledgeChunksBuilt) return;
+  const id = String(chatbot._id);
+  if (chunkBuildInflight.has(id)) {
+    await chunkBuildInflight.get(id);
+    return;
+  }
+
+  const job = (async () => {
+    const { buildKnowledgeChunksForChatbot } = require('./chunkingService');
+    await buildKnowledgeChunksForChatbot(chatbot);
+  })();
+
+  chunkBuildInflight.set(id, job);
+  try {
+    await job;
+  } catch (error) {
+    console.error('[knowledge] Chunk build failed:', error.message);
+  } finally {
+    chunkBuildInflight.delete(id);
+  }
+}
+
+/**
+ * Get knowledge for a chatbot.
+ * Uses cached text on the DB document when present; otherwise extracts and saves it.
+ * Also builds vector chunks once (first call may await; later calls skip).
+ */
+async function getChatbotKnowledge(chatbot) {
+  let knowledge = '';
+
+  if (chatbot.knowledgeTextCache && chatbot.knowledgeTextCache.trim()) {
+    console.log(`[knowledge] Using cached knowledge for bot "${chatbot.name}" (${chatbot.knowledgeTextCache.length} chars)`);
+    knowledge = chatbot.knowledgeTextCache;
+  } else {
+    console.log(`[knowledge] Building knowledge cache for bot "${chatbot.name}"…`);
+    knowledge = await buildKnowledgeFromPdfs(chatbot);
+    await persistKnowledgeCache(chatbot, knowledge);
+  }
+
+  await ensureKnowledgeChunks(chatbot).catch((err) => {
+    console.warn('[knowledge] Chunk ensure skipped:', err.message);
+  });
   return knowledge;
 }
 

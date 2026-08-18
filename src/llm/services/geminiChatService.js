@@ -5,6 +5,10 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { geminiConfig, assertGeminiConfigured, getModelCandidates } = require('../config/geminiConfig');
 const { buildSystemPrompt, buildTurnInstruction } = require('../prompts/chatbotPrompt');
 const { withModelFallback } = require('../utils/geminiHelper');
+const {
+  searchKnowledgeChunks,
+  formatChunksForPrompt,
+} = require('./knowledgeRetrievalService');
 
 let client = null;
 
@@ -33,7 +37,22 @@ async function generateChatReply({ chatbot, knowledgeText, session, userText }) 
     session.isActivated = true;
   }
 
-  const systemPrompt = buildSystemPrompt(chatbot, knowledgeText, session.isActivated);
+  let retrievedText = '';
+  try {
+    const chunks = await searchKnowledgeChunks({
+      chatbotId: chatbot._id,
+      query: userText,
+      topK: 4,
+    });
+    retrievedText = formatChunksForPrompt(chunks);
+  } catch (err) {
+    console.error('[gemini] RAG retrieve failed:', err.message);
+  }
+
+  const knowledgeForPrompt = retrievedText
+    || String(knowledgeText || '').slice(0, 4000);
+
+  const systemPrompt = buildSystemPrompt(chatbot, knowledgeForPrompt, session.isActivated);
   const turnInstruction = buildTurnInstruction(userText, session.isActivated);
 
   const history = (session.history || []).map((item) => ({

@@ -1,4 +1,5 @@
 const ChatbotModel = require('../models/chatbotModel');
+const { deleteKnowledgeChunksForChatbot } = require('../llm/services/chunkingService');
 const { upload } = require('../utils/uploadHelper');
 const { processPDFImages } = require('../utils/pdfProcessor');
 const fs = require('fs');
@@ -219,11 +220,13 @@ const deleteChatbot = async (req, res) => {
         }
 
         // Delete from database
+        const { deletedCount: chunksDeleted } = await deleteKnowledgeChunksForChatbot(chatbot._id);
         await ChatbotModel.findByIdAndDelete(id);
 
         res.status(200).json({
             success: true,
-            message: "Chatbot and all associated files deleted successfully"
+            message: "Chatbot and all associated files deleted successfully",
+            chunksDeleted,
         });
 
     } catch (error) {
@@ -323,6 +326,10 @@ async function destroyChatbotRecord(chatbot) {
             fs.rmSync(resolved, { recursive: true, force: true });
             console.log(`[chatbot] Removed upload folder: ${safeName}`);
         }
+    }
+    const { deletedCount: chunksDeleted } = await deleteKnowledgeChunksForChatbot(chatbot._id);
+    if (chunksDeleted > 0) {
+        console.log(`[chatbot] Removed ${chunksDeleted} vector chunk(s) for bot ${chatbot._id}`);
     }
     await ChatbotModel.findByIdAndDelete(chatbot._id);
 }
@@ -855,6 +862,8 @@ const updateChatbot = async (req, res) => {
             if (pdfsChanged) {
                 chatbot.knowledgeTextCache = '';
                 chatbot.knowledgeCachedAt = undefined;
+                chatbot.knowledgeChunksBuilt = false;
+                chatbot.knowledgeChunksBuiltAt = null;
             }
 
             const saved = await chatbot.save();

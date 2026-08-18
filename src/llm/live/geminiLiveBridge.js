@@ -7,7 +7,15 @@ const { geminiConfig, assertGeminiConfigured } = require('../config/geminiConfig
 const { buildChatbotLiveInstruction, buildTopicGreeting } = require('./chatbotLivePrompt');
 const { formatGeminiErrorForUser } = require('../utils/geminiHelper');
 const { SUBMIT_LEAD_TOOL } = require('./liveLeadTools');
+const { SEARCH_KNOWLEDGE_TOOL } = require('./liveKnowledgeTools');
+const { SET_PRESENTATION_TOPIC_TOOL } = require('./liveImageTools');
 const { saveLead } = require('../services/leadService');
+const {
+  searchKnowledgeChunks,
+  getOverviewChunks,
+  formatChunksForPrompt,
+  normalizeRagQuery,
+} = require('../services/knowledgeRetrievalService');
 const {
   buildNumberedImageCatalog,
   resolveSlideshowForTopicKey,
@@ -20,17 +28,65 @@ const {
 const {
   isNoiseTranscript,
   detectActivation,
+  hasGreetingWakeKey,
+  isJunkWakeTranscript,
+  isActivationOnlyUtterance,
+  shouldDispatchImagesForUtterance,
+  shouldVadFallbackActivate,
 } = require('./liveActivation');
+const { classifyWakeUtterance, classifyWakeText, isWakeTextCandidate } = require('../services/wakeDetectService');
+const { toRomanDisplay } = require('./romanizeTranscript');
 
 const FALLBACK_LIVE_MODELS = [
   'gemini-2.5-flash-native-audio-preview-12-2025',
-  'gemini-2.5-flash-native-audio-preview',
-  'gemini-live-2.5-flash-preview',
-  'gemini-2.0-flash-live-001',
+  'gemini-3.1-flash-live-preview',
+  'gemini-live-2.5-flash-native-audio',
 ].filter(Boolean);
 
 const liveSessions = new Map();
 const audioChunkCounts = new Map();
+const liveStartLocks = new Map();
+const pendingSessionStops = new Map();
+
+function cancelPendingSessionStop(socketId) {
+  const timer = pendingSessionStops.get(socketId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingSessionStops.delete(socketId);
+  }
+}
+
+function findReusableLiveSession(chatbotId, preferSocketId) {
+  const id = String(chatbotId);
+  const trySid = (sid) => {
+    const entry = liveSessions.get(sid);
+    if (entry?.geminiSession && entry.setupDone?.() && String(entry.meta?.chatbotId) === id) {
+      return { socketId: sid, entry };
+    }
+    return null;
+  };
+
+  if (preferSocketId) {
+    const hit = trySid(preferSocketId);
+    if (hit) return hit;
+  }
+
+  for (const sid of pendingSessionStops.keys()) {
+    const hit = trySid(sid);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function adoptLiveSession(entry, socket, fromSocketId) {
+  if (fromSocketId && fromSocketId !== socket.id) {
+    liveSessions.delete(fromSocketId);
+  }
+  cancelPendingSessionStop(fromSocketId);
+  cancelPendingSessionStop(socket.id);
+  entry.meta.socket = socket;
+  liveSessions.set(socket.id, entry);
+}
 
 function msBetween(start, end = Date.now()) {
   if (!start) return null;
@@ -43,7 +99,34 @@ function formatMs(ms) {
   return `${ms}ms`;
 }
 
+function cancelRagPrefetch(meta) {
+  if (meta?.ragPrefetchTimer) {
+    clearTimeout(meta.ragPrefetchTimer);
+    meta.ragPrefetchTimer = null;
+  }
+}
+
+/** Drop slideshow from the previous question so AC slides don't leak into a Solar answer. */
+function clearSlideshowForNewQuestion(meta) {
+  meta.fullPdfPool = [];
+  meta.pendingSlideshow = [];
+  meta.currentSlideshow = [];
+  meta.lastShownImageId = null;
+  meta.slideshowEmittedKey = null;
+  meta.lastSpeechSyncLen = 0;
+  meta.lastImageSyncAt = 0;
+  meta.imageShownThisTurn = false;
+  meta.deferredShowImageIds = [];
+  meta.topicDispatchedThisTurn = false;
+}
+
 function resetTurnLatency(meta, reason = '') {
+  cancelRagPrefetch(meta);
+  meta.turnRagCache = null;
+  meta.ragPrefetchInFlight = false;
+  meta.pendingRagQuery = '';
+  meta.lockedPdfKey = null;
+  meta.llmTopicSetThisTurn = false;
   meta.latency = {
     turnId: (meta.latency?.turnId || 0) + 1,
     reason: reason || '',
@@ -54,9 +137,22 @@ function resetTurnLatency(meta, reason = '') {
     firstModelAudioAt: 0,
     firstModelTextAt: 0,
     turnCompleteAt: 0,
+    firstUplinkAt: 0,
+    firstUplinkHopMs: null,
+    ragStartedAt: 0,
+    ragMs: null,
+    wakeReceivedAt: 0,
     loggedFirstAudio: false,
     loggedComplete: false,
+    loggedUplinkHop: false,
   };
+}
+
+function speakDurationMs(L) {
+  if (!L?.userAudioStartAt) return null;
+  const end = L.userSpeechEndAt || L.lastUserAudioAt || 0;
+  if (!end) return null;
+  return Math.max(0, end - L.userAudioStartAt);
 }
 
 function emitLatency(meta, phase, extra = {}) {
@@ -67,21 +163,29 @@ function emitLatency(meta, phase, extra = {}) {
     phase,
     turnId: L.turnId || 0,
     serverNow: now,
+    speakDurationMs: speakDurationMs(L),
+    feToBeHopMs: L.firstUplinkHopMs,
+    ragMs: L.ragMs,
     sinceUserAudioStartMs: msBetween(L.userAudioStartAt, now),
     sinceUserSpeechEndMs: msBetween(L.userSpeechEndAt, now),
     userAudioToFirstSttMs: msBetween(L.userAudioStartAt, L.firstUserSttAt),
+    speechEndToFirstSttMs: msBetween(L.userSpeechEndAt, L.firstUserSttAt),
     userAudioToFirstBotAudioMs: msBetween(L.userAudioStartAt, L.firstModelAudioAt),
     speechEndToFirstBotAudioMs: msBetween(L.userSpeechEndAt, L.firstModelAudioAt),
+    speechEndToFirstBotTextMs: msBetween(L.userSpeechEndAt, L.firstModelTextAt),
     userAudioToTurnCompleteMs: msBetween(L.userAudioStartAt, L.turnCompleteAt || now),
     speechEndToTurnCompleteMs: msBetween(L.userSpeechEndAt, L.turnCompleteAt || now),
     ...extra,
   };
 
+  const hop = payload.feToBeHopMs != null ? payload.feToBeHopMs : extra.feToBeHopMs;
   console.log(
     `[LATENCY][BE] turn#${payload.turnId} ${phase}`
-    + ` | audio→STT ${formatMs(payload.userAudioToFirstSttMs)}`
-    + ` | audio→botAudio ${formatMs(payload.userAudioToFirstBotAudioMs)}`
+    + ` | spoke ${formatMs(payload.speakDurationMs)}`
+    + ` | FE→BE hop ${formatMs(hop ?? extra.feToBeHopMs)}`
+    + ` | speechEnd→STT ${formatMs(payload.speechEndToFirstSttMs)}`
     + ` | speechEnd→botAudio ${formatMs(payload.speechEndToFirstBotAudioMs)}`
+    + ` | RAG ${formatMs(payload.ragMs)}`
     + ` | audio→done ${formatMs(payload.userAudioToTurnCompleteMs)}`
     + (extra.detail ? ` | ${extra.detail}` : '')
   );
@@ -98,13 +202,17 @@ function markUserSpeechStart(meta, source = 'uplink') {
   if (!meta.latency) resetTurnLatency(meta, 'init');
 
   const L = meta.latency;
-  // Ignore duplicate starts during same open turn
-  if (L.userAudioStartAt && !L.turnCompleteAt && !L.firstModelAudioAt) {
+  const openTurn = L.userAudioStartAt && !L.turnCompleteAt && !L.firstModelAudioAt;
+  const previousEnded = Boolean(L.userSpeechEndAt);
+  // Same open utterance — ignore duplicate VAD starts. After a pause, start a new turn.
+  if (openTurn && !previousEnded) {
     L.lastUserAudioAt = Date.now();
     return;
   }
 
   resetTurnLatency(meta, source);
+  clearSlideshowForNewQuestion(meta);
+  meta.botResponseTurnId = null;
   meta.latency.userAudioStartAt = Date.now();
   meta.latency.lastUserAudioAt = meta.latency.userAudioStartAt;
   console.log(`[LATENCY][BE] turn#${meta.latency.turnId} USER question started (${source})`);
@@ -130,8 +238,12 @@ function markUserSpeechEnd(meta, source = 'client') {
   }
   if (L.userSpeechEndAt) return;
   L.userSpeechEndAt = Date.now();
-  console.log(`[LATENCY][BE] turn#${L.turnId} USER speech end (${source})`);
-  emitLatency(meta, 'user_speech_end', { detail: source });
+  meta.botAnswerForTurnId = L.turnId;
+  const spoke = speakDurationMs(L);
+  console.log(
+    `[LATENCY][BE] turn#${L.turnId} USER speech end (${source}) — spoke ${formatMs(spoke)}`
+  );
+  emitLatency(meta, 'user_speech_end', { detail: source, speakDurationMs: spoke });
 }
 
 function markFirstUserStt(meta, text) {
@@ -151,7 +263,12 @@ function markFirstModelAudio(meta) {
   if (L.firstModelAudioAt) return;
   L.firstModelAudioAt = Date.now();
   L.loggedFirstAudio = true;
-  emitLatency(meta, 'first_bot_audio');
+  if (meta.botResponseTurnId == null) {
+    meta.botResponseTurnId = L.turnId;
+  }
+  emitLatency(meta, 'first_bot_audio', {
+    detail: `LLM first audio after speech-end ${formatMs(msBetween(L.userSpeechEndAt))}`,
+  });
 }
 
 function markFirstModelText(meta) {
@@ -159,7 +276,21 @@ function markFirstModelText(meta) {
   const L = meta.latency;
   if (L.firstModelTextAt) return;
   L.firstModelTextAt = Date.now();
+  if (meta.botResponseTurnId == null) {
+    meta.botResponseTurnId = L.turnId;
+  }
   emitLatency(meta, 'first_bot_text');
+}
+
+function isStaleBotTurnComplete(meta) {
+  const currentTurn = meta.latency?.turnId ?? 0;
+  if (meta.botResponseTurnId != null && currentTurn > meta.botResponseTurnId) {
+    return true;
+  }
+  if (meta.botAnswerForTurnId != null && currentTurn > meta.botAnswerForTurnId) {
+    return true;
+  }
+  return false;
 }
 
 function markTurnCompleteLatency(meta) {
@@ -169,6 +300,15 @@ function markTurnCompleteLatency(meta) {
   L.turnCompleteAt = Date.now();
   L.loggedComplete = true;
   emitLatency(meta, 'turn_complete');
+  console.log(
+    `[LATENCY][BE] SUMMARY turn#${L.turnId}`
+    + ` | user spoke ${formatMs(speakDurationMs(L))}`
+    + ` | FE→BE hop ${formatMs(L.firstUplinkHopMs)}`
+    + ` | speechEnd→STT ${formatMs(msBetween(L.userSpeechEndAt, L.firstUserSttAt))}`
+    + ` | speechEnd→RAG ${formatMs(L.ragMs)}`
+    + ` | speechEnd→LLM audio ${formatMs(msBetween(L.userSpeechEndAt, L.firstModelAudioAt))}`
+    + ` | speechEnd→done ${formatMs(msBetween(L.userSpeechEndAt, L.turnCompleteAt))}`
+  );
 }
 
 function normalizeModelId(model) {
@@ -201,12 +341,14 @@ function createSessionMeta(socket, chatbot) {
     pendingSlideshow: null,
     pendingPdfName: null,
     pendingPdfKey: null,
+    lockedPdfKey: null,
     slideshowEmittedKey: null,
     assistantBuffer: '',
     spokenTurnText: '',
     imageShownThisTurn: false,
     lastShownImageId: null,
     lastSpeechSyncLen: 0,
+    lastImageSyncAt: 0,
     deferredShowImageIds: [],
     topicDispatchedThisTurn: false,
     leadDraft: { name: '', company: '', designation: '', phone: '', email: '' },
@@ -218,18 +360,33 @@ function createSessionMeta(socket, chatbot) {
     isActivated: false,
     activatedAt: 0,
     wakePending: false,
+    wakeClassifyInFlight: false,
+    wakeAttemptId: 0,
+    wakeSpeakMs: null,
     ignoreWakeUntil: 0,
     suppressOutput: false,
     micEnabled: false,
     userUtteranceBuffer: '',
     userStreamBuffer: '',
+    lastEmittedUserStt: '',
     greetNudgeSent: false,
+    awaitingGreetingTurn: false,
+    discardSttUntilTurnComplete: false,
+    greetTurnUnlocked: false,
+    turnRagCache: null,
+    ragPrefetchInFlight: false,
+    ragPrefetchTimer: null,
+    pendingRagQuery: '',
+    llmTopicSetThisTurn: false,
+    botResponseTurnId: null,
+    botAnswerForTurnId: null,
     lastSpeechEndAt: 0,
     wakeActivationTimer: null,
     wakeAudioEndTimer: null,
     setupDone: false,
     geminiSession: null,
     model: null,
+    overviewImageIds: [],
     latency: {
       turnId: 0,
       reason: '',
@@ -240,8 +397,14 @@ function createSessionMeta(socket, chatbot) {
       firstModelAudioAt: 0,
       firstModelTextAt: 0,
       turnCompleteAt: 0,
+      firstUplinkAt: 0,
+      firstUplinkHopMs: null,
+      ragStartedAt: 0,
+      ragMs: null,
+      wakeReceivedAt: 0,
       loggedFirstAudio: false,
       loggedComplete: false,
+      loggedUplinkHop: false,
     },
   };
 }
@@ -381,38 +544,322 @@ function pickLeadFields(args, draft, preferDraft) {
   };
 }
 
+function lockPdfKey(meta, pdfKey) {
+  const key = String(pdfKey || '').trim();
+  if (!key || key.toLowerCase() === 'general') return;
+  meta.lockedPdfKey = key;
+}
+
+function poolForLockedPdf(meta) {
+  const lock = meta.lockedPdfKey || meta.pendingPdfKey;
+  if (!lock) return [];
+  return (meta.catalog || []).filter((img) => img.pdfKey === lock);
+}
+
+function resolvePdfKeyForSearch(meta, rawPdfKey) {
+  const raw = String(rawPdfKey || meta.pendingPdfKey || '').trim();
+  if (!raw) return undefined;
+  const result = resolveSlideshowForTopicKey(meta.catalog, meta.topics, raw);
+  return result.matched ? result.pdfKey : undefined;
+}
+
+function inferPdfKeyFromQuery(query, topics) {
+  const q = ` ${normalizeRagQuery(query, { topics }).toLowerCase()} `;
+  const compact = String(query || '').replace(/\s+/g, '').toLowerCase();
+  if (!q.trim() && !compact) return undefined;
+
+  const word = (s) => new RegExp(`(?:^|[^a-z0-9])${String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:[^a-z0-9]|$)`, 'i');
+
+  const findTopic = (pred) => (topics || []).find(pred);
+
+  if (
+    /\b(ac[\s-]?kit|ackit|acki?t|sikt)\b/i.test(q)
+    || /sikt|ackit|acki?t/.test(compact)
+  ) {
+    const ac = findTopic((t) => /ac|cooling|kit/i.test(`${t.displayName} ${t.pdfKey}`));
+    if (ac) return ac.pdfKey;
+  }
+
+  if (
+    /\b(solar|solos|cleaning|panel|solosistam|solarsystem|faayada|phaayada|benefit)\b/i.test(q)
+    || /solosistam|solarsystem|solarpanel|autoclean/.test(compact)
+  ) {
+    const solar = findTopic((t) => /solar|easy/i.test(`${t.displayName} ${t.pdfKey}`));
+    if (solar) return solar.pdfKey;
+  }
+
+  if (
+    /\b(machinery|machines|machine|dashboard|centralized|ecosystem|multipl|venue|organization)\b/i.test(q)
+    || /ecosystem|dashboard|machinery|centralized/.test(compact)
+  ) {
+    const eco = findTopic((t) => /ecosystem/i.test(`${t.displayName} ${t.pdfKey}`));
+    if (eco) return eco.pdfKey;
+  }
+
+  for (const t of topics || []) {
+    const name = String(t.displayName || '').replace(/\.pdf$/i, '').trim().toLowerCase();
+    const keyPhrase = String(t.pdfKey || '').replace(/_/g, ' ').toLowerCase();
+    if (name.length >= 4 && word(name).test(q)) return t.pdfKey;
+    if (/\bgateway\b/.test(q) && /gateway/.test(name)) return t.pdfKey;
+    if (/\bsolar\b/.test(q) && /solar/.test(name)) return t.pdfKey;
+    if (/\bac\b/.test(q) && /ac|cooling/.test(name)) return t.pdfKey;
+    if (keyPhrase.length >= 4 && word(keyPhrase).test(q)) return t.pdfKey;
+  }
+  return undefined;
+}
+
+function scheduleRagPrefetch(meta, rawQuery, delayMs = 700) {
+  if (!meta?.isActivated || meta.leadFormShown || meta.awaitingGreetingTurn) return;
+  const spoken = String(rawQuery || meta.userStreamBuffer || meta.userUtteranceBuffer || '').trim();
+  if (!spoken || !shouldDispatchImagesForUtterance(spoken)) return;
+  if (isActivationOnlyUtterance(spoken, meta.chatbot)) return;
+
+  meta.pendingRagQuery = spoken;
+  const turnId = meta.latency?.turnId || 0;
+  cancelRagPrefetch(meta);
+
+  meta.ragPrefetchTimer = setTimeout(() => {
+    meta.ragPrefetchTimer = null;
+    if ((meta.latency?.turnId || 0) !== turnId) return;
+    const latest = String(meta.pendingRagQuery || meta.userStreamBuffer || '').trim();
+    if (!latest) return;
+    prefetchRagForUserQuestion(meta, latest, turnId).catch(() => {});
+  }, delayMs);
+}
+
+async function prefetchRagForUserQuestion(meta, rawQuery, forTurnId) {
+  const spoken = String(rawQuery || meta.userStreamBuffer || meta.userUtteranceBuffer || '').trim();
+  if (!spoken || !meta.isActivated || meta.leadFormShown || meta.awaitingGreetingTurn) return;
+  if (!shouldDispatchImagesForUtterance(spoken)) return;
+  if (isActivationOnlyUtterance(spoken, meta.chatbot)) return;
+
+  const turnId = forTurnId ?? meta.latency?.turnId ?? 0;
+  if ((meta.latency?.turnId || 0) !== turnId) return;
+
+  meta.ragPrefetchInFlight = true;
+  meta.ragPrefetchTurnId = turnId;
+  if (meta.latency && !meta.latency.ragStartedAt) {
+    meta.latency.ragStartedAt = Date.now();
+  }
+
+  const pdfKey = resolvePdfKeyForSearch(meta, meta.pendingPdfKey)
+    || (meta.llmTopicSetThisTurn ? meta.lockedPdfKey : undefined)
+    || undefined;
+  const pdfName = pdfKey
+    ? meta.topics?.find((t) => t.pdfKey === pdfKey)?.displayName
+    : undefined;
+
+  try {
+    const chunks = await searchKnowledgeChunks({
+      chatbotId: meta.chatbotId,
+      query: spoken,
+      pdfKey,
+      pdfName,
+      topics: meta.topics,
+      topK: 6,
+    });
+
+    if ((meta.latency?.turnId || 0) !== turnId) {
+      console.log(`[live] Dropped stale RAG prefetch for turn#${turnId}`);
+      return;
+    }
+
+    const ragMs = meta.latency?.ragStartedAt
+      ? Date.now() - meta.latency.ragStartedAt
+      : null;
+    if (meta.latency && ragMs != null) {
+      meta.latency.ragMs = ragMs;
+      emitLatency(meta, 'rag_done', {
+        ragMs,
+        detail: `${chunks.length} chunk(s) prefetch ${formatMs(ragMs)}`,
+      });
+    }
+
+    meta.turnRagCache = {
+      query: normalizeRagQuery(spoken, { topics: meta.topics, pdfName, pdfKey }),
+      rawQuery: spoken,
+      pdfKey,
+      chunks,
+      at: Date.now(),
+    };
+
+    // Images are LLM-driven via setPresentationTopic — do not guess from STT here.
+
+    if (
+      chunks.length
+      && meta.geminiSession
+      && !meta.latency?.firstModelAudioAt
+      && !meta.latency?.firstModelTextAt
+    ) {
+      const body = formatChunksForPrompt(chunks);
+      meta.geminiSession.sendClientContent({
+        turns: [{
+          role: 'user',
+          parts: [{
+            text:
+              `[RAG_CONTEXT] Visitor question (Roman): "${toRomanDisplay(spoken)}". `
+              + 'Answer in AUDIO using ONLY these PDF excerpts. '
+              + 'Do NOT say documents are missing — the content is below:\n\n'
+              + body,
+          }],
+        }],
+        turnComplete: true,
+      });
+      console.log(`[live] Injected ${chunks.length} RAG chunk(s) before bot reply`);
+    }
+  } catch (err) {
+    console.warn('[live] prefetch RAG failed:', err.message);
+  } finally {
+    meta.ragPrefetchInFlight = false;
+  }
+}
+
+function applyOverviewImagePool(meta) {
+  const ids = Array.isArray(meta.overviewImageIds) ? meta.overviewImageIds : [];
+  if (!ids.length) return;
+  const images = ids
+    .map((id) => findCatalogImageById(meta.catalog, id))
+    .filter(Boolean);
+  if (!images.length) return;
+  meta.pendingSlideshow = images;
+  meta.fullPdfPool = images;
+  meta.pendingPdfName = images[0]?.pdfName || null;
+  meta.pendingPdfKey = images[0]?.pdfKey || 'general';
+}
+
+/** Clear slideshow on frontend — show chatbot onboarding / display image. */
+function showOnboardingDisplay(meta, reason = 'general') {
+  if (meta.leadFormShown) return;
+  meta.currentSlideshow = [];
+  meta.pendingSlideshow = [];
+  meta.fullPdfPool = [];
+  meta.slideshowEmittedKey = 'onboarding';
+  meta.lastShownImageId = null;
+  meta.pendingPdfKey = null;
+  meta.pendingPdfName = null;
+  emitJson(meta.socket, { type: 'show_onboarding', reason });
+}
+
+/** Collect unique catalog images linked to retrieved vector chunks. */
+function collectImagesFromRagChunks(chunks, catalog) {
+  const seen = new Set();
+  const images = [];
+  for (const chunk of chunks || []) {
+    for (const rawId of chunk.relatedImageIds || []) {
+      const id = Number(rawId);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const img = findCatalogImageById(catalog, id);
+      if (img) images.push(img);
+    }
+  }
+  return images;
+}
+
+/** Emit full slideshow pool to frontend (after LLM picks topic). */
+function emitSlideshowPool(meta, result, initialSlideIndex = 0) {
+  if (!result?.images?.length) return;
+  const poolKey = `${result.pdfKey}:all`;
+  meta.slideshowEmittedKey = poolKey;
+  meta.currentSlideshow = result.images;
+  meta.pendingSlideshow = result.images;
+  meta.fullPdfPool = result.images;
+  meta.pendingPdfKey = result.pdfKey;
+  meta.pendingPdfName = result.pdfName;
+  emitJson(meta.socket, {
+    type: 'images',
+    images: result.images.map(formatImageForFrontend),
+    pdfName: result.pdfName,
+    pdfKey: result.pdfKey,
+    replace: true,
+    holdCarouselMs: 0,
+    autoAdvance: false,
+    initialSlideIndex: Math.max(0, initialSlideIndex),
+  });
+}
+
+/**
+ * LLM → backend: load slideshow for the topic the model chose (authoritative).
+ * Called from setPresentationTopic tool or [[TOPIC:]] marker.
+ */
+function applyPresentationTopic(meta, topicKey, imageId = null, options = {}) {
+  if (meta.leadFormShown) {
+    return { success: false, reason: 'lead_form_active' };
+  }
+
+  const topicNorm = String(topicKey || '').trim().toLowerCase();
+  if (!topicNorm || topicNorm === 'general') {
+    showOnboardingDisplay(meta, 'general_topic');
+    meta.llmTopicSetThisTurn = true;
+    return { success: true, pdfKey: 'general', imageCount: 0 };
+  }
+
+  const result = resolveSlideshowForTopicKey(meta.catalog, meta.topics, topicKey);
+  if (!result.matched || !result.images.length) {
+    if (meta.isActivated && !meta.leadFormShown) {
+      showOnboardingDisplay(meta, 'unknown_topic');
+    }
+    return { success: false, pdfKey: topicKey, reason: 'no_pdf_match' };
+  }
+
+  if (
+    meta.llmTopicSetThisTurn
+    && meta.lockedPdfKey
+    && result.pdfKey !== meta.lockedPdfKey
+    && !options.allowSwitch
+  ) {
+    console.log(
+      `[live] Ignore TOPIC "${topicKey}" (${result.pdfKey}) — this turn is locked to ${meta.lockedPdfKey}`
+    );
+    return {
+      success: false,
+      reason: 'topic_already_set',
+      pdfKey: meta.lockedPdfKey,
+    };
+  }
+
+  lockPdfKey(meta, result.pdfKey);
+  meta.llmTopicSetThisTurn = true;
+  emitSlideshowPool(meta, result);
+
+  let targetId = imageId != null ? Number(imageId) : null;
+  const inCatalog = targetId && findCatalogImageById(meta.catalog, targetId);
+  if (inCatalog && inCatalog.pdfKey !== result.pdfKey) {
+    targetId = null;
+  }
+  if (!targetId) {
+    const related = collectImagesFromRagChunks(meta.turnRagCache?.chunks || [], meta.catalog)
+      .filter((img) => img.pdfKey === result.pdfKey);
+    targetId = related[0]?.id || result.images[0]?.id;
+  }
+
+  if (targetId) {
+    emitImageSync(meta, targetId, { force: true });
+    meta.imageShownThisTurn = true;
+  }
+  flushDeferredShowImages(meta, true);
+
+  console.log(
+    `[live] LLM topic "${topicKey}" → ${result.images.length} image(s) from "${result.pdfName}"`
+    + (targetId ? ` | showing id=${targetId}` : '')
+  );
+
+  return {
+    success: true,
+    pdfKey: result.pdfKey,
+    pdfName: result.pdfName,
+    imageCount: result.images.length,
+    shownImageId: targetId,
+  };
+}
+
 /**
  * [[TOPIC: pdfKey]] from assistant response only.
  * Prepares the image pool — does NOT flash wrong slides.
  * Visible images appear when [[SHOW_IMAGE:N]] fires.
  */
-function dispatchSlideshowForTopic(meta, topicKey) {
-  const result = resolveSlideshowForTopicKey(meta.catalog, meta.topics, topicKey);
-
-  if (!result.matched || !result.images.length) {
-    meta.pendingSlideshow = [];
-    meta.fullPdfPool = [];
-    meta.currentSlideshow = [];
-    meta.slideshowEmittedKey = null;
-    // Do not wipe UI while lead form is up (TOPIC General was hiding the form)
-    if (!meta.leadFormShown) {
-      emitJson(meta.socket, {
-        type: 'show_onboarding',
-        topic: topicKey,
-        reason: 'general_or_unknown_topic',
-      });
-    }
-    console.log(`[live] LLM topic "${topicKey}" → onboarding (no images)`);
-    return;
-  }
-
-  meta.pendingSlideshow = result.images;
-  meta.fullPdfPool = result.images;
-  meta.pendingPdfName = result.pdfName;
-  meta.pendingPdfKey = result.pdfKey;
-  console.log(
-    `[live] LLM topic "${topicKey}" → prepared ${result.images.length} image(s) from "${result.pdfName}" (waiting for SHOW_IMAGE)`
-  );
+function dispatchSlideshowForTopic(meta, topicKey, options = {}) {
+  applyPresentationTopic(meta, topicKey, options.imageId ?? null, options);
 }
 
 /**
@@ -422,6 +869,7 @@ function dispatchSlideshowForTopic(meta, topicKey) {
 function emitImageSync(meta, catalogImageId, options = {}) {
   const fromSpeech = Boolean(options.fromSpeech);
   const recentSpeech = String(options.speechText || meta.spokenTurnText || '').trim();
+  let locked = meta.lockedPdfKey || meta.pendingPdfKey;
 
   let pdfPool = Array.isArray(meta.pendingSlideshow) && meta.pendingSlideshow.length
     ? meta.pendingSlideshow
@@ -431,16 +879,31 @@ function emitImageSync(meta, catalogImageId, options = {}) {
         ? meta.currentSlideshow
         : [];
 
-  const preferred = findCatalogImageById(meta.catalog, catalogImageId);
-  if (preferred && (!pdfPool.length || !pdfPool.some((img) => img.pdfKey === preferred.pdfKey))) {
-    pdfPool = (meta.catalog || []).filter((img) => img.pdfKey === preferred.pdfKey);
+  if (locked) {
+    pdfPool = (meta.catalog || []).filter((img) => img.pdfKey === locked);
   }
-  if (!pdfPool.length && preferred) {
+
+  const preferred = findCatalogImageById(meta.catalog, catalogImageId);
+  if (preferred && locked && preferred.pdfKey !== locked) {
+    console.log(
+      `[live] Ignore SHOW_IMAGE:${catalogImageId} (${preferred.pdfKey}) — locked to ${locked}`
+    );
+    return;
+  }
+
+  if (preferred && (!pdfPool.length || !pdfPool.some((img) => img.pdfKey === preferred.pdfKey))) {
+    if (locked && preferred.pdfKey !== locked) {
+      pdfPool = poolForLockedPdf(meta);
+    } else {
+      pdfPool = (meta.catalog || []).filter((img) => img.pdfKey === preferred.pdfKey);
+    }
+  }
+  if (!pdfPool.length && preferred && (!locked || preferred.pdfKey === locked)) {
     pdfPool = (meta.catalog || []).filter((img) => img.pdfKey === preferred.pdfKey);
   }
 
   const picked = pickClusterForSpeech(
-    pdfPool.length ? pdfPool : meta.catalog,
+    pdfPool.length ? pdfPool : (locked ? poolForLockedPdf(meta) : []),
     recentSpeech,
     catalogImageId
   );
@@ -451,6 +914,17 @@ function emitImageSync(meta, catalogImageId, options = {}) {
 
   if (!target) {
     console.warn(`[live] SHOW_IMAGE:${catalogImageId} — not found in catalog`);
+    return;
+  }
+  if (locked && target.pdfKey !== locked) {
+    console.log(`[live] Drop image ${target.id} (${target.pdfKey}) — locked to ${locked}`);
+    return;
+  }
+
+  const poolKey = `${target.pdfKey}:all`;
+  const needEmitImages = meta.slideshowEmittedKey !== poolKey;
+  const prevShownId = meta.lastShownImageId;
+  if (!options.force && Number(prevShownId) === Number(target.id) && !needEmitImages) {
     return;
   }
 
@@ -467,8 +941,6 @@ function emitImageSync(meta, catalogImageId, options = {}) {
 
   const displayPool = meta.fullPdfPool.length ? meta.fullPdfPool : cluster;
   const slideIndex = Math.max(0, displayPool.findIndex((img) => Number(img.id) === Number(target.id)));
-  const poolKey = `${target.pdfKey}:all`;
-  const needEmitImages = meta.slideshowEmittedKey !== poolKey;
 
   meta.currentSlideshow = displayPool;
   meta.pendingSlideshow = meta.fullPdfPool;
@@ -476,6 +948,7 @@ function emitImageSync(meta, catalogImageId, options = {}) {
   meta.pendingPdfName = target.pdfName;
   meta.imageShownThisTurn = true;
   meta.lastShownImageId = target.id;
+  meta.lastImageSyncAt = Date.now();
 
   if (needEmitImages) {
     meta.slideshowEmittedKey = poolKey;
@@ -491,25 +964,28 @@ function emitImageSync(meta, catalogImageId, options = {}) {
     });
   }
 
-  emitJson(meta.socket, {
-    type: 'image_sync',
-    imageId: target.id,
-    slideIndex: Math.max(0, slideIndex),
-    timestamp: Date.now(),
-  });
-
-  console.log(
-    `[live] SHOW → slide ${slideIndex + 1}/${cluster.length} id=${target.id} "${String(target.topic).slice(0, 55)}"`
-  );
+  if (needEmitImages || Number(prevShownId) !== Number(target.id)) {
+    emitJson(meta.socket, {
+      type: 'image_sync',
+      imageId: target.id,
+      slideIndex: Math.max(0, slideIndex),
+      pdfName: target.pdfName,
+      timestamp: Date.now(),
+    });
+    console.log(
+      `[live] SHOW → slide ${slideIndex + 1}/${cluster.length} id=${target.id} "${String(target.topic).slice(0, 55)}"`
+    );
+  }
 }
 
 /** Progressive sync: as LLM speaks, switch section cluster to match recent words. */
 function syncImagesFromRecentSpeech(meta, force = false) {
   const spoken = String(meta.spokenTurnText || '').trim();
-  if (spoken.length < 20) return;
+  if (spoken.length < 30) return;
 
   const sinceLast = spoken.length - (meta.lastSpeechSyncLen || 0);
-  if (!force && sinceLast < 22) return;
+  if (!force && sinceLast < 50) return;
+  if (!force && meta.lastImageSyncAt && Date.now() - meta.lastImageSyncAt < 1500) return;
   meta.lastSpeechSyncLen = spoken.length;
 
   const recent = spoken.slice(-200);
@@ -530,7 +1006,11 @@ function syncImagesFromRecentSpeech(meta, force = false) {
   if (focusScore < 2 && !force) return;
 
   const newKey = `${picked.focus.pdfKey}:sec:${picked.cluster.map((i) => i.id).join(',')}`;
-  if (newKey === meta.slideshowEmittedKey && meta.lastShownImageId === picked.focus.id) {
+  if (
+    !force
+    && Number(meta.lastShownImageId) === Number(picked.focus.id)
+    && meta.slideshowEmittedKey === newKey
+  ) {
     return;
   }
 
@@ -569,12 +1049,11 @@ function flushDeferredShowImages(meta, force = false) {
   if (!queue.length) return;
 
   const spokenLen = String(meta.spokenTurnText || '').trim().length;
-  if (!force && spokenLen < 28) return;
+  if (!force && spokenLen < 40) return;
 
   meta.deferredShowImageIds = [];
-  for (const imageId of queue) {
-    emitImageSync(meta, imageId);
-  }
+  const lastId = queue[queue.length - 1];
+  if (lastId) emitImageSync(meta, lastId);
 }
 
 /** After full answer text is known, fix a clearly wrong slide. */
@@ -583,7 +1062,7 @@ function revalidateShownImage(meta) {
 }
 
 function parseAssistantMarkers(meta, chunkText) {
-  meta.assistantBuffer += chunkText;
+  meta.assistantBuffer = appendTranscript(meta.assistantBuffer, chunkText);
   let buffer = meta.assistantBuffer;
 
   // Process TOPIC markers (may appear once per turn)
@@ -598,16 +1077,23 @@ function parseAssistantMarkers(meta, chunkText) {
       if (key !== 'general') {
         meta.topicCounts[key] = (meta.topicCounts[key] || 0) + 1;
       }
-      dispatchSlideshowForTopic(meta, topic);
+      if (!meta.awaitingGreetingTurn || key === 'general') {
+        dispatchSlideshowForTopic(meta, topic, { fromLlm: true, force: true });
+      }
     }
   }
 
-  // SHOW_IMAGE — defer briefly until we have spoken words (markers often arrive first)
+  // SHOW_IMAGE — only after topic is locked; ignore ids from other PDFs
   let imageMatch;
   while ((imageMatch = buffer.match(/\[\[SHOW_IMAGE:(\d+)\]\]/i))) {
     const imageId = parseInt(imageMatch[1], 10);
     buffer = buffer.replace(imageMatch[0], '');
-    if (String(meta.spokenTurnText || '').trim().length < 28) {
+    if (!meta.llmTopicSetThisTurn && !meta.lockedPdfKey) {
+      if (!Array.isArray(meta.deferredShowImageIds)) meta.deferredShowImageIds = [];
+      meta.deferredShowImageIds.push(imageId);
+      continue;
+    }
+    if (String(meta.spokenTurnText || '').trim().length < 40) {
       if (!Array.isArray(meta.deferredShowImageIds)) meta.deferredShowImageIds = [];
       meta.deferredShowImageIds.push(imageId);
     } else {
@@ -659,9 +1145,9 @@ function parseAssistantMarkers(meta, chunkText) {
 
   const spokenBit = String(cleaned || '').replace(/\s+/g, ' ').trim();
   if (spokenBit) {
-    meta.spokenTurnText = `${meta.spokenTurnText || ''} ${spokenBit}`.trim();
+    meta.spokenTurnText = appendTranscript(meta.spokenTurnText || '', spokenBit);
     flushDeferredShowImages(meta, false);
-    syncImagesFromRecentSpeech(meta, false);
+    // Do NOT sync images on every STT chunk — only at turn end or via RAG/SHOW_IMAGE.
   }
 
   return { cleaned };
@@ -751,6 +1237,124 @@ async function handleToolCall(toolCall, meta) {
           response: { error: err.message },
         });
       }
+    } else if (call.name === 'searchKnowledgeBase') {
+      const args = call.args || {};
+      const query = String(args.query || '').trim();
+      const pdfKey = String(args.pdfKey || '').trim() || undefined;
+
+      if (
+        meta.awaitingGreetingTurn
+        || (
+          meta.activatedAt
+          && Date.now() - meta.activatedAt < 12000
+          && isActivationOnlyUtterance(meta.userUtteranceBuffer || query, meta.chatbot)
+        )
+      ) {
+        responses.push({
+          id: call.id,
+          name: call.name,
+          response: {
+            result: 'SKIP — visitor only said the wake phrase. Greet briefly; do not search yet.',
+            matchCount: 0,
+          },
+        });
+        continue;
+      }
+
+      try {
+        if (meta.latency) {
+          meta.latency.ragStartedAt = Date.now();
+        }
+        emitLatency(meta, 'rag_start', { detail: query.slice(0, 80) });
+        const t0 = Date.now();
+
+        const resolvedPdfKey = pdfKey
+          ? resolvePdfKeyForSearch(meta, pdfKey)
+          : undefined;
+        const pdfName = resolvedPdfKey
+          ? meta.topics?.find((t) => t.pdfKey === resolvedPdfKey)?.displayName
+          : undefined;
+        const spokenQuery = query || String(meta.userUtteranceBuffer || meta.spokenTurnText || '').trim();
+
+        const cache = meta.turnRagCache;
+        const cacheFresh = cache?.chunks?.length
+          && Date.now() - (cache.at || 0) < 45000
+          && (
+            !spokenQuery
+            || normalizeRagQuery(spokenQuery, { topics: meta.topics, pdfName, pdfKey: resolvedPdfKey })
+              .includes(normalizeRagQuery(cache.rawQuery || '', { topics: meta.topics }).slice(0, 8))
+            || normalizeRagQuery(cache.rawQuery || '', { topics: meta.topics })
+              .includes(normalizeRagQuery(spokenQuery, { topics: meta.topics }).slice(0, 8))
+          );
+
+        let chunks = cacheFresh ? cache.chunks : [];
+        if (!chunks.length) {
+          chunks = await searchKnowledgeChunks({
+            chatbotId: meta.chatbotId,
+            query: spokenQuery,
+            pdfKey: resolvedPdfKey,
+            pdfName,
+            topics: meta.topics,
+            topK: 6,
+          });
+        }
+        const ragMs = Date.now() - t0;
+        if (meta.latency) meta.latency.ragMs = ragMs;
+
+        const body = formatChunksForPrompt(chunks);
+        const emptyRag = 'SEARCH RETURNED 0 RESULTS. Say politely you could not find that exact detail in the indexed excerpts, then offer to help with another topic from your documents. Do NOT invent pricing or specs.';
+        const topKey = chunks[0]?.pdfKey || pdfKey || resolvedPdfKey || '';
+        const topImageId = chunks[0]?.relatedImageIds?.[0];
+        const imageRule = topKey
+          ? `\n\nREQUIRED BEFORE SPEAKING: call setPresentationTopic(pdfKey="${topKey}"${topImageId ? `, imageId=${topImageId}` : ''}). `
+            + 'Use the pdfKey that matches the VISITOR QUESTION MEANING (machinery/dashboard → ecosystem_pdf, AC → ac_pdf, solar → easy_solar). '
+            + 'Ignore garbled STT. Then emit [[SHOW_IMAGE:N]] as you speak each point.'
+          : '\n\nREQUIRED: call setPresentationTopic with the correct pdfKey before speaking.';
+        responses.push({
+          id: call.id,
+          name: call.name,
+          response: {
+            result: (body || emptyRag) + imageRule,
+            matchCount: chunks.length,
+            suggestedPdfKey: topKey || undefined,
+          },
+        });
+        emitLatency(meta, 'rag_done', {
+          ragMs,
+          detail: `${chunks.length} chunk(s) in ${formatMs(ragMs)}`,
+        });
+        if (!chunks.length) {
+          console.warn(
+            `[live] RAG miss chatbotId=${meta.chatbotId} pdfKey=${resolvedPdfKey || 'any'}`
+            + ` query="${normalizeRagQuery(spokenQuery, { topics: meta.topics, pdfName }).slice(0, 80)}"`
+          );
+        }
+        console.log(
+          `[live] searchKnowledgeBase "${normalizeRagQuery(spokenQuery, { topics: meta.topics }).slice(0, 80)}"`
+          + ` → ${chunks.length} chunk(s) in ${ragMs}ms${cacheFresh ? ' (cache)' : ''}`
+        );
+      } catch (err) {
+        responses.push({
+          id: call.id,
+          name: call.name,
+          response: { error: err.message || 'Knowledge search failed' },
+        });
+        console.error('[live] searchKnowledgeBase failed:', err.message);
+      }
+    } else if (call.name === 'setPresentationTopic') {
+      const args = call.args || {};
+      const pdfKey = String(args.pdfKey || '').trim();
+      const imageId = args.imageId != null ? Number(args.imageId) : null;
+      const outcome = applyPresentationTopic(meta, pdfKey, imageId, { fromLlm: true });
+      responses.push({
+        id: call.id,
+        name: call.name,
+        response: outcome,
+      });
+      console.log(
+        `[live] setPresentationTopic "${pdfKey}" → ${outcome.success ? 'ok' : outcome.reason}`
+        + (outcome.shownImageId ? ` id=${outcome.shownImageId}` : '')
+      );
     }
   }
 
@@ -798,23 +1402,76 @@ function appendTranscript(buffer, chunk) {
   return joined.replace(/\s+/g, ' ').trim();
 }
 
+function requestLlmWakeMatch(meta, heard) {
+  if (!meta || meta.isActivated) return;
+  if (meta.ignoreWakeUntil && Date.now() < meta.ignoreWakeUntil) return;
+
+  const roman = toRomanDisplay(heard);
+  if (!isWakeTextCandidate(roman || heard)) return;
+
+  const stamp = String(roman || heard).toLowerCase();
+  if (meta.wakeTextTried === stamp || meta.wakeTextClassifyInFlight) return;
+  meta.wakeTextTried = stamp;
+  meta.wakeTextClassifyInFlight = true;
+  console.log(`[live] LLM resemblance check for "${roman}"`);
+
+  Promise.resolve(classifyWakeText({ chatbot: meta.chatbot, heard: roman || heard }))
+    .then((result) => {
+      if (meta.isActivated) return;
+      if (!result.match) return;
+      console.log(
+        `[live] Wake MATCH via LLM resemblance — heard "${roman}"`
+        + ` key=${result.matchedKey || meta.chatbot.activationKey}`
+      );
+      activateSession(meta, result.matchedKey || roman, { greet: true });
+    })
+    .catch((err) => {
+      console.warn('[live] LLM wake resemblance failed:', err.message);
+    })
+    .finally(() => {
+      meta.wakeTextClassifyInFlight = false;
+    });
+}
+
 function flushUserTranscript(meta) {
+  if (meta.discardSttUntilTurnComplete) {
+    meta.userStreamBuffer = '';
+    return;
+  }
+
   const full = cleanTranscriptNoise(meta.userStreamBuffer);
   meta.userStreamBuffer = '';
   if (!full || isNoiseTranscript(full)) return;
 
-  console.log(`[live] USER said: "${full}"`);
-  emitJson(meta.socket, { type: 'transcript', role: 'user', text: full, final: true });
+  const shown = toRomanDisplay(full);
+  console.log(`[live] USER said: "${shown}"`);
+  meta.lastEmittedUserStt = '';
+  emitJson(meta.socket, { type: 'transcript', role: 'user', text: shown, final: true });
 
   if (!meta.isActivated && detectActivation(full, meta.chatbot)) {
-    console.log(`[live] Activation keyword matched in STT: "${full}"`);
+    console.log(`[live] Activation keyword matched in STT: "${shown}"`);
     activateSession(meta, full, { greet: true });
   } else if (!meta.isActivated) {
-    console.log(`[live] Onboarding — heard "${full}" but not an activation keyword`);
+    console.log(`[live] Onboarding — heard "${shown}" — LLM checking resemblance to saved key`);
+    requestLlmWakeMatch(meta, shown || full);
   }
 
   if (meta.isActivated) {
     mergeLeadDraft(meta, full);
+
+    // Prefetch RAG images as soon as full user STT is known — before LLM tool call
+    if (
+      !meta.leadFormShown
+      && !meta.awaitingGreetingTurn
+      && shouldDispatchImagesForUtterance(full)
+      && !isActivationOnlyUtterance(full, meta.chatbot)
+    ) {
+      cancelRagPrefetch(meta);
+      const turnId = meta.latency?.turnId || 0;
+      prefetchRagForUserQuestion(meta, full, turnId).catch((err) => {
+        console.warn('[live] prefetch RAG images failed:', err.message);
+      });
+    }
 
     // Fast path: visitor says yes while form is on screen → save immediately
     if (
@@ -862,6 +1519,22 @@ function cleanTranscriptNoise(text) {
     .trim();
 }
 
+function invalidateWakeAttempts(meta) {
+  meta.wakeAttemptId = (meta.wakeAttemptId || 0) + 1;
+  meta.wakeClassifyInFlight = false;
+  meta.wakePending = false;
+  if (meta.wakeActivationTimer) {
+    clearTimeout(meta.wakeActivationTimer);
+    meta.wakeActivationTimer = null;
+  }
+}
+
+function isWakeAttemptCurrent(meta, attemptId) {
+  if (meta.isActivated) return false;
+  if (meta.ignoreWakeUntil && Date.now() < meta.ignoreWakeUntil) return false;
+  return attemptId === meta.wakeAttemptId;
+}
+
 function activateSession(meta, heard, { greet = false } = {}) {
   if (meta.isActivated) return false;
   if (meta.ignoreWakeUntil && Date.now() < meta.ignoreWakeUntil) {
@@ -878,43 +1551,95 @@ function activateSession(meta, heard, { greet = false } = {}) {
     meta.wakeAudioEndTimer = null;
   }
 
+  invalidateWakeAttempts(meta);
+
+  meta.assistantBuffer = '';
+  meta.spokenTurnText = '';
+  meta.deferredShowImageIds = [];
+  meta.topicDispatchedThisTurn = false;
+  meta.imageShownThisTurn = false;
+  meta.lastShownImageId = null;
+  meta.lastSpeechSyncLen = 0;
+
   meta.isActivated = true;
   meta.activatedAt = Date.now();
-  meta.wakePending = false;
   meta.ignoreWakeUntil = 0;
-  meta.suppressOutput = false;
   emitJson(meta.socket, { type: 'activated' });
-  console.log(`[live] Activated — heard: "${heard}"${greet ? ' (with greet nudge)' : ''}`);
+  const sinceSpeechEnd = msBetween(meta.latency?.userSpeechEndAt);
+  const sinceWake = msBetween(meta.latency?.wakeReceivedAt);
+  console.log(
+    `[live] Activated — heard: "${heard}"${greet ? ' (with greet nudge)' : ''}`
+    + ` | since speech-end ${formatMs(sinceSpeechEnd)} | since wake ${formatMs(sinceWake)}`
+  );
+  emitLatency(meta, 'activated', {
+    detail: `keyword matched; speechEnd→activate ${formatMs(sinceSpeechEnd)}`,
+  });
 
-  // Only nudge when Gemini did not already hear the user (empty STT fallback).
-  if (greet && meta.geminiSession && !meta.greetNudgeSent) {
-    meta.greetNudgeSent = true;
-    const botName = meta.chatbot.name || 'Assistant';
-    const greetingTopics = buildTopicGreeting(meta.topics || []);
-    try {
-      meta.geminiSession.sendClientContent({
-        turns: [{
-          role: 'user',
-          parts: [{
-            text:
-              `[USER_ACTIVATED] Greet once as ${botName} in AUDIO. `
-              + `Warm detailed intro: who you are, that you help with ${greetingTopics}, `
-              + `features/benefits/how things work. Invite any question. `
-              + `About 4–5 spoken sentences. [[TOPIC: General]]. No PDF names. Never say "and more".`,
-          }],
-        }],
-        turnComplete: true,
+  if (greet && meta.geminiSession) {
+    meta.awaitingGreetingTurn = true;
+    meta.greetTurnUnlocked = false;
+    meta.suppressOutput = true;
+    meta.discardSttUntilTurnComplete = true;
+
+    const wakeDisplay = toRomanDisplay(
+      String(heard || meta.userStreamBuffer || '').trim()
+    );
+    if (wakeDisplay) {
+      emitJson(meta.socket, {
+        type: 'transcript',
+        role: 'user',
+        text: wakeDisplay,
+        final: true,
       });
-    } catch (err) {
-      console.warn('[live] Activation nudge failed:', err.message);
-      meta.greetNudgeSent = false;
     }
+    meta.userStreamBuffer = '';
+    meta.userUtteranceBuffer = '';
+    meta.lastEmittedUserStt = '';
+
+    try {
+      meta.geminiSession.sendRealtimeInput({ audioStreamEnd: true });
+    } catch (err) {
+      console.warn('[live] audioStreamEnd on activate failed:', err.message);
+    }
+
+    if (!meta.greetNudgeSent) {
+      meta.greetNudgeSent = true;
+      const botName = meta.chatbot.name || 'Assistant';
+      const greetingTopics = buildTopicGreeting(meta.topics || []);
+      try {
+        meta.geminiSession.sendClientContent({
+          turns: [{
+            role: 'user',
+            parts: [{
+              text:
+                `[USER_ACTIVATED] The visitor ONLY said the wake phrase — NOT a product question. `
+                + `Reply with AUDIO ONLY: a short greeting as ${botName}. `
+                + `Two or three sentences: who you are, you can help with ${greetingTopics}, invite a question. `
+                + `Do NOT call searchKnowledgeBase. Do NOT describe products yet. `
+                + `[[TOPIC: General]]. No PDF names. Never say "and more".`,
+            }],
+          }],
+          turnComplete: true,
+        });
+      } catch (err) {
+        console.warn('[live] Activation nudge failed:', err.message);
+        meta.greetNudgeSent = false;
+        meta.awaitingGreetingTurn = false;
+        meta.greetTurnUnlocked = false;
+        meta.suppressOutput = false;
+        meta.discardSttUntilTurnComplete = false;
+      }
+    }
+  } else {
+    meta.suppressOutput = false;
   }
 
   return true;
 }
 
 function accumulateUserTranscript(meta, chunk) {
+  if (meta.discardSttUntilTurnComplete) return;
+
   // Incremental STT often arrives 1–2 chars at a time — do not drop as "noise"
   const cleaned = String(chunk || '')
     .replace(/<noise>/gi, ' ')
@@ -926,10 +1651,18 @@ function accumulateUserTranscript(meta, chunk) {
   meta.userStreamBuffer = appendTranscript(meta.userStreamBuffer, cleaned);
   meta.userUtteranceBuffer = meta.userStreamBuffer;
 
-  if (!meta.isActivated) {
-    console.log(`[live] STT (wake): "${meta.userStreamBuffer}"`);
-  } else {
+  const shown = toRomanDisplay(meta.userStreamBuffer);
+  if (shown && shown !== meta.lastEmittedUserStt) {
+    meta.lastEmittedUserStt = shown;
+    console.log(`[live] USER (live): "${shown}"`);
+    emitJson(meta.socket, { type: 'transcript', role: 'user', text: shown, final: false });
+  }
+
+  if (meta.isActivated) {
     markFirstUserStt(meta, cleaned);
+    if (meta.latency?.userSpeechEndAt) {
+      scheduleRagPrefetch(meta, meta.userStreamBuffer, 350);
+    }
   }
 
   if (!meta.isActivated && detectActivation(meta.userStreamBuffer, meta.chatbot)) {
@@ -958,6 +1691,7 @@ function stripMarkerText(text) {
 function handleLiveMessage(meta, message) {
   if (message.toolCall) {
     if (!meta.isActivated) return;
+    emitLatency(meta, 'tool_call', { detail: (message.toolCall.functionCalls || []).map((c) => c.name).join(',') });
     handleToolCall(message.toolCall, meta).catch((err) => {
       console.error('[live] Tool call error:', err.message);
     });
@@ -989,9 +1723,11 @@ function handleLiveMessage(meta, message) {
     meta.lastShownImageId = null;
     meta.lastSpeechSyncLen = 0;
     meta.deferredShowImageIds = [];
+    meta.botResponseTurnId = null;
     // Never wipe user STT on interrupt — wake keyword lives in this buffer
     if (meta.isActivated) {
       meta.userStreamBuffer = '';
+      meta.lastEmittedUserStt = '';
     }
     meta.topicDispatchedThisTurn = false;
   }
@@ -1007,7 +1743,13 @@ function handleLiveMessage(meta, message) {
   for (const part of parts) {
     const inline = part.inlineData;
     if (inline?.data && inline?.mimeType?.includes('audio')) {
-      if (meta.suppressOutput) continue;
+      if (meta.suppressOutput) {
+        if (meta.awaitingGreetingTurn && meta.greetTurnUnlocked) {
+          meta.suppressOutput = false;
+        } else {
+          continue;
+        }
+      }
       if (!meta.isActivated) {
         if (meta.ignoreWakeUntil && Date.now() < meta.ignoreWakeUntil) continue;
         const buf = String(meta.userStreamBuffer || '').trim();
@@ -1031,15 +1773,50 @@ function handleLiveMessage(meta, message) {
   }
 
   if (sc.turnComplete) {
+    if (meta.awaitingGreetingTurn && meta.suppressOutput) {
+      meta.greetTurnUnlocked = true;
+      meta.discardSttUntilTurnComplete = false;
+      meta.userStreamBuffer = '';
+      meta.lastEmittedUserStt = '';
+      meta.assistantBuffer = '';
+      meta.spokenTurnText = '';
+      meta.deferredShowImageIds = [];
+      meta.topicDispatchedThisTurn = false;
+      console.log('[live] Dropped spurious wake-turn reply — waiting for greeting');
+      return;
+    }
+
+    if (isStaleBotTurnComplete(meta)) {
+      console.log(
+        `[live] Ignoring stale turn_complete — bot turn#${meta.botResponseTurnId}`
+        + `, current turn#${meta.latency?.turnId}`
+      );
+      meta.assistantBuffer = '';
+      meta.spokenTurnText = '';
+      meta.deferredShowImageIds = [];
+      meta.botResponseTurnId = null;
+      meta.botAnswerForTurnId = null;
+      return;
+    }
+
+    if (meta.discardSttUntilTurnComplete) {
+      meta.discardSttUntilTurnComplete = false;
+      meta.userStreamBuffer = '';
+      meta.lastEmittedUserStt = '';
+    }
+
     flushUserTranscript(meta);
     if (meta.isActivated && !meta.suppressOutput) {
       markTurnCompleteLatency(meta);
       flushDeferredShowImages(meta, true);
-      revalidateShownImage(meta);
-      autoSyncImageFromSpeech(meta);
       flushAssistantTranscript(meta);
       emitJson(meta.socket, { type: 'turn_complete' });
     }
+    if (meta.awaitingGreetingTurn && !meta.suppressOutput) {
+      meta.awaitingGreetingTurn = false;
+    }
+    meta.botResponseTurnId = null;
+    meta.botAnswerForTurnId = null;
     meta.assistantBuffer = '';
     meta.spokenTurnText = '';
     meta.imageShownThisTurn = false;
@@ -1061,7 +1838,7 @@ function connectAndWaitForSetup(ai, model, liveConfig, meta) {
     rejectSetup = reject;
     setupTimer = setTimeout(() => {
       reject(new Error(`Setup timed out for model ${model}`));
-    }, 15000);
+    }, Number(meta.setupTimeoutMs) || 18000);
   });
   // WS can fail before .then() attaches — avoid unhandledRejection crash
   setupPromise.catch(() => {});
@@ -1139,10 +1916,64 @@ function connectAndWaitForSetup(ai, model, liveConfig, meta) {
 async function startGeminiLiveForSocket(socket, chatbot, knowledgeText) {
   assertGeminiConfigured();
 
+  const existing = liveSessions.get(socket.id);
+  if (
+    existing?.geminiSession
+    && existing.setupDone?.()
+    && String(existing.meta?.chatbotId) === String(chatbot._id)
+  ) {
+    existing.meta.socket = socket;
+    console.log(`[live] Reusing Gemini session (${existing.meta.model}) — bot "${chatbot.name}"`);
+    return { model: existing.meta.model, reused: true };
+  }
+
+  const reusable = findReusableLiveSession(chatbot._id, socket.id);
+  if (reusable?.entry) {
+    adoptLiveSession(reusable.entry, socket, reusable.socketId);
+    console.log(
+      `[live] Rebound Gemini session (${reusable.entry.meta.model}) `
+      + `→ socket ${socket.id} — bot "${chatbot.name}"`
+    );
+    return { model: reusable.entry.meta.model, reused: true };
+  }
+
+  if (liveStartLocks.has(socket.id)) {
+    console.log('[live] Waiting for in-flight Gemini start…');
+    return liveStartLocks.get(socket.id);
+  }
+
+  const job = actuallyStartGeminiLive(socket, chatbot, knowledgeText);
+  liveStartLocks.set(socket.id, job);
+  try {
+    return await job;
+  } finally {
+    liveStartLocks.delete(socket.id);
+  }
+}
+
+async function actuallyStartGeminiLive(socket, chatbot, knowledgeTextOrLoader) {
   await stopGeminiLiveForSocket(socket.id);
   audioChunkCounts.delete(socket.id);
 
+  const knowledgeText = typeof knowledgeTextOrLoader === 'function'
+    ? await knowledgeTextOrLoader()
+    : (knowledgeTextOrLoader || '');
+
   const meta = createSessionMeta(socket, chatbot);
+  // Overview images are not required to open Gemini — load in parallel.
+  getOverviewChunks(chatbot._id)
+    .then((overview) => {
+      const ids = [];
+      for (const chunk of overview) {
+        for (const id of chunk.relatedImageIds || []) ids.push(Number(id));
+      }
+      meta.overviewImageIds = [...new Set(ids.filter(Boolean))];
+    })
+    .catch((err) => {
+      meta.overviewImageIds = [];
+      console.warn('[live] overview chunks unavailable:', err.message);
+    });
+
   const ai = new GoogleGenAI({ apiKey: geminiConfig.apiKey });
   const systemText = buildChatbotLiveInstruction(chatbot, knowledgeText);
   console.log(`[live] System instruction ${systemText.length} chars (keep small for fast replies)`);
@@ -1158,16 +1989,21 @@ async function startGeminiLiveForSocket(socket, chatbot, knowledgeText) {
       },
     },
     systemInstruction: { parts: [{ text: systemText }] },
-    tools: [{ functionDeclarations: SUBMIT_LEAD_TOOL.functionDeclarations }],
+    tools: [{
+      functionDeclarations: [
+        ...SUBMIT_LEAD_TOOL.functionDeclarations,
+        ...SEARCH_KNOWLEDGE_TOOL.functionDeclarations,
+        ...SET_PRESENTATION_TOPIC_TOOL.functionDeclarations,
+      ],
+    }],
     inputAudioTranscription: {},
     outputAudioTranscription: {},
     realtimeInputConfig: {
       activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
       automaticActivityDetection: {
-        // HIGH so wake words like "hello" actually produce inputTranscription
         startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
         endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
-        silenceDurationMs: 900,
+        silenceDurationMs: Number(process.env.GEMINI_SILENCE_DURATION_MS) || 1600,
         prefixPaddingMs: 120,
       },
     },
@@ -1178,9 +2014,12 @@ async function startGeminiLiveForSocket(socket, chatbot, knowledgeText) {
   );
 
   let lastError = null;
+  let quotaError = null;
 
-  for (const model of candidates) {
+  for (let i = 0; i < candidates.length; i += 1) {
+    const model = candidates[i];
     try {
+      meta.setupTimeoutMs = i === 0 ? 20000 : 7000;
       console.log(`[live] Connecting Gemini Live → ${model}`);
       const session = await connectAndWaitForSetup(ai, model, liveConfig, meta);
 
@@ -1195,12 +2034,25 @@ async function startGeminiLiveForSocket(socket, chatbot, knowledgeText) {
     } catch (err) {
       lastError = err;
       meta.setupDone = false;
+      try {
+        meta.geminiSession?.close?.();
+      } catch {
+        /* ignore */
+      }
       meta.geminiSession = null;
-      console.warn(`[live] Model failed (${model}):`, err.message);
+      const msg = String(err?.message || '');
+      if (/quota exceeded|resource exhausted/i.test(msg)) quotaError = err;
+      if (/is not found|not supported for bidiGenerateContent/i.test(msg)) {
+        console.warn(`[live] Skipping retired Live model (${model})`);
+      } else {
+        console.warn(`[live] Model failed (${model}):`, msg);
+      }
     }
   }
 
-  const msg = lastError?.message || 'No compatible Gemini Live model available';
+  const msg = quotaError?.message
+    || lastError?.message
+    || 'No compatible Gemini Live model available';
   emitJson(socket, { type: 'error', message: msg });
   throw new Error(msg);
 }
@@ -1209,7 +2061,7 @@ function getSessionEntry(socketId) {
   return liveSessions.get(socketId);
 }
 
-function sendLiveAudio(socketId, { data, mimeType }) {
+function sendLiveAudio(socketId, { data, mimeType, clientT }) {
   const entry = getSessionEntry(socketId);
   if (!entry?.geminiSession || !entry.setupDone?.()) return false;
   if (!entry.meta?.micEnabled) return false;
@@ -1226,10 +2078,26 @@ function sendLiveAudio(socketId, { data, mimeType }) {
     markUserAudioChunk(entry.meta);
   }
 
+  const receivedAt = Date.now();
+  const hop = Number(clientT) > 0 ? receivedAt - Number(clientT) : null;
+  const L = entry.meta.latency;
+  if (L && hop != null && !L.loggedUplinkHop) {
+    L.loggedUplinkHop = true;
+    L.firstUplinkAt = receivedAt;
+    L.firstUplinkHopMs = hop;
+    emitLatency(entry.meta, 'audio_uplink_hop', {
+      feToBeHopMs: hop,
+      detail: `voice packet FE→BE ${formatMs(hop)}`,
+    });
+  }
+
   const count = (audioChunkCounts.get(socketId) || 0) + 1;
   audioChunkCounts.set(socketId, count);
   if (count === 1 || count % 50 === 0) {
-    console.log(`[live] Audio chunks: ${count} (socket ${socketId})`);
+    console.log(
+      `[live] Audio chunks: ${count} (socket ${socketId})`
+      + (hop != null ? ` | last hop ${formatMs(hop)}` : '')
+    );
   }
 
   entry.geminiSession.sendRealtimeInput({
@@ -1250,6 +2118,8 @@ function interruptLiveSession(socketId) {
     meta.spokenTurnText = '';
     meta.deferredShowImageIds = [];
     meta.topicDispatchedThisTurn = false;
+    meta.botResponseTurnId = null;
+    cancelRagPrefetch(meta);
     console.log(`[live] Barge-in (socket ${socketId}) — waiting for user audio`);
     return true;
   } catch {
@@ -1278,8 +2148,8 @@ function endLiveAudioStream(socketId) {
   }
 }
 
-/** Wake path: frontend already detected a real spoken phrase. */
-function handleWakeAttempt(socketId) {
+/** Wake path: dedicated classifier on the VAD clip, then main Live LLM. */
+async function handleWakeAttempt(socketId, payload = {}) {
   const entry = getSessionEntry(socketId);
   if (!entry?.geminiSession) return;
 
@@ -1291,20 +2161,106 @@ function handleWakeAttempt(socketId) {
   }
 
   const now = Date.now();
-  if (now - (meta.lastSpeechEndAt || 0) < 900) return;
-  // Already waiting on a wake — don't reset the timer (spam cancels greeting)
-  if (meta.wakePending && meta.wakeActivationTimer) {
-    console.log('[live] Wake already pending — ignoring duplicate');
-    return;
+  if (now - (meta.lastSpeechEndAt || 0) < 400) return;
+
+  // Supersede any in-flight wake — never block the user's latest attempt
+  if (meta.wakeActivationTimer) {
+    clearTimeout(meta.wakeActivationTimer);
+    meta.wakeActivationTimer = null;
   }
+  meta.wakeAttemptId = (meta.wakeAttemptId || 0) + 1;
+  const attemptId = meta.wakeAttemptId;
+
+  const speakMs = Number(payload.speakMs);
   meta.lastSpeechEndAt = now;
   meta.wakePending = true;
+  meta.wakeSpeakMs = Number.isFinite(speakMs) ? speakMs : null;
 
-  console.log(`[live] Wake attempt (socket ${socketId}) — waiting for STT keyword match`);
+  resetTurnLatency(meta, 'wake');
+  const spoke = Number.isFinite(speakMs) ? speakMs : 0;
+  meta.latency.userAudioStartAt = now - spoke;
+  meta.latency.lastUserAudioAt = now;
+  meta.latency.userSpeechEndAt = now;
+  meta.latency.wakeReceivedAt = now;
 
-  // Keep the audio stream open. Cutting it at 550ms was producing empty STT
-  // ("hello" never landed in the transcript buffer).
+  const hop = Number(payload.clientT) > 0 ? now - Number(payload.clientT) : null;
+  emitLatency(meta, 'wake_received', {
+    feToBeHopMs: hop,
+    speakDurationMs: spoke || null,
+    detail: `wake FE→BE ${formatMs(hop)} spoke ${formatMs(spoke)}`,
+  });
+
+  endLiveAudioStream(socketId);
   scheduleWakeActivation(meta);
+
+  const clip = String(payload.data || '').trim();
+  const CLASSIFY_TIMEOUT_MS = Number(process.env.WAKE_CLASSIFY_TIMEOUT_MS) || 8000;
+
+  if (clip) {
+    meta.wakeClassifyInFlight = true;
+    emitLatency(meta, 'wake_classify_start', { detail: 'dedicated wake prompt' });
+    try {
+      const t0 = Date.now();
+      const result = await Promise.race([
+        classifyWakeUtterance({
+          chatbot: meta.chatbot,
+          base64Audio: clip,
+          mimeType: payload.mimeType || 'audio/pcm;rate=16000',
+        }),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('wake classify timeout')), CLASSIFY_TIMEOUT_MS);
+        }),
+      ]);
+      const classifyMs = Date.now() - t0;
+
+      if (!isWakeAttemptCurrent(meta, attemptId)) {
+        console.log('[live] Wake classify result ignored — superseded or already activated');
+        return;
+      }
+
+      emitLatency(meta, 'wake_classify_done', {
+        detail: `match=${result.match} heard="${result.heard}" in ${formatMs(classifyMs)}`,
+      });
+
+      if (result.match) {
+        console.log(
+          `[live] Wake MATCH via dedicated detector — heard "${toRomanDisplay(result.heard)}"`
+          + ` en="${result.english || ''}"`
+          + ` key=${result.matchedKey || meta.chatbot.activationKey}`
+        );
+        activateSession(meta, result.matchedKey || result.english || result.heard || 'wake', { greet: true });
+        return;
+      }
+
+      if (!result.parseOk && shouldVadFallbackActivate({
+        chatbot: meta.chatbot,
+        sttText: result.heard || result.raw,
+        speakMs: spoke,
+      })) {
+        console.log('[live] Wake MATCH via VAD fallback (classifier JSON incomplete)');
+        activateSession(meta, result.heard || 'wake', { greet: true });
+        return;
+      }
+
+      console.log(
+        `[live] Wake detector: no keyword in clip (heard "${toRomanDisplay(result.heard || '')}"`
+        + ` en="${result.english || ''}")`
+      );
+      meta.wakePending = false;
+    } catch (err) {
+      if (!isWakeAttemptCurrent(meta, attemptId)) return;
+      console.warn('[live] Wake classifier failed — STT fallback active:', err.message);
+    } finally {
+      if (attemptId === meta.wakeAttemptId) {
+        meta.wakeClassifyInFlight = false;
+      }
+    }
+  } else {
+    console.log(
+      `[live] Wake attempt (socket ${socketId}) — VAD phrase ${formatMs(spoke)}`
+      + ` | greetingKey=${hasGreetingWakeKey(meta.chatbot)} | clip=no`
+    );
+  }
 }
 
 /** After activation, Gemini automatic VAD owns turn-taking — do NOT audioStreamEnd. */
@@ -1323,14 +2279,36 @@ function handleUserSpeechEnd(socketId) {
 /** Explicit client timing marks (speech start/end from mic VAD). */
 function handleClientLatencyMark(socketId, payload = {}) {
   const entry = getSessionEntry(socketId);
-  if (!entry?.meta?.isActivated) return;
+  if (!entry?.meta) return;
   const phase = String(payload.phase || '');
+  const hop = Number(payload.t) > 0 ? Date.now() - Number(payload.t) : null;
   if (phase === 'user_speech_start') {
-    markUserSpeechStart(entry.meta, 'frontend_vad_start');
+    markUserSpeechStart(entry.meta, entry.meta.isActivated ? 'frontend_vad_start' : 'frontend_wake_start');
+    if (hop != null) {
+      emitLatency(entry.meta, 'vad_start_hop', {
+        feToBeHopMs: hop,
+        detail: `VAD start mark FE→BE ${formatMs(hop)}`,
+      });
+    }
     return;
   }
   if (phase === 'user_speech_end') {
-    markUserSpeechEnd(entry.meta, 'frontend_vad_end');
+    markUserSpeechEnd(entry.meta, entry.meta.isActivated ? 'frontend_vad_end' : 'frontend_wake_end');
+    if (hop != null) {
+      emitLatency(entry.meta, 'vad_end_hop', {
+        feToBeHopMs: hop,
+        speakDurationMs: Number(payload.speakMs) || speakDurationMs(entry.meta.latency),
+        detail: `VAD end mark FE→BE ${formatMs(hop)}`,
+      });
+    }
+    if (entry.meta.isActivated && !entry.meta.awaitingGreetingTurn) {
+      const buf = cleanTranscriptNoise(
+        entry.meta.userStreamBuffer || entry.meta.userUtteranceBuffer || ''
+      );
+      if (buf) {
+        scheduleRagPrefetch(entry.meta, buf, 650);
+      }
+    }
   }
 }
 
@@ -1340,41 +2318,79 @@ function scheduleWakeActivation(meta) {
     meta.wakeActivationTimer = null;
   }
 
-  const tryActivateFromStt = () => {
+  const speakMs = meta.wakeSpeakMs;
+  const clearWakeTimer = () => {
+    if (meta.wakeActivationTimer) {
+      clearTimeout(meta.wakeActivationTimer);
+      meta.wakeActivationTimer = null;
+    }
+  };
+
+  const sttBuffer = () => cleanTranscriptNoise(meta.userStreamBuffer || meta.userUtteranceBuffer || '');
+
+  const tryActivate = (reason) => {
     if (meta.isActivated) return true;
     if (meta.ignoreWakeUntil && Date.now() < meta.ignoreWakeUntil) return false;
-    const buf = cleanTranscriptNoise(meta.userStreamBuffer || meta.userUtteranceBuffer || '');
-    if (buf) {
-      console.log(`[live] Wake STT buffer: "${buf}"`);
-    }
+    const buf = sttBuffer();
+    if (buf) console.log(`[live] Wake STT buffer: "${toRomanDisplay(buf)}"`);
+
     if (buf && detectActivation(buf, meta.chatbot)) {
-      // STT matched — still nudge greet so user always hears intro (audio may have been dropped pre-activate)
       activateSession(meta, buf, { greet: true });
+      return true;
+    }
+
+    if (buf) requestLlmWakeMatch(meta, buf);
+
+    if (shouldVadFallbackActivate({ chatbot: meta.chatbot, sttText: buf, speakMs })) {
+      console.log(
+        `[live] VAD-first wake — junk/empty STT "${buf || '(empty)'}"`
+        + ` after ${formatMs(speakMs)} (greeting key)`
+      );
+      activateSession(meta, buf || reason || 'vad_phrase', { greet: true });
       return true;
     }
     return false;
   };
 
-  if (tryActivateFromStt()) return;
+  if (tryActivate('immediate')) return;
 
-  // Wait for Gemini inputTranscription — "hello" often arrives after the pause.
-  const delays = [400, 800, 1400, 2200, 3500, 5000];
+  const bufNow = sttBuffer();
+  const junkAlready = isJunkWakeTranscript(bufNow);
+  const greetingKey = hasGreetingWakeKey(meta.chatbot);
+
+  // Wrong-script STT will not become "hello" if we wait 5s — peek once, then VAD fallback.
+  if (junkAlready && greetingKey) {
+    meta.wakeActivationTimer = setTimeout(() => {
+      if (tryActivate('junk_stt_peek')) return;
+      if (shouldVadFallbackActivate({ chatbot: meta.chatbot, sttText: sttBuffer(), speakMs })) {
+        activateSession(meta, sttBuffer() || 'vad_junk_stt', { greet: true });
+        return;
+      }
+      meta.wakePending = false;
+      clearWakeTimer();
+    }, 300);
+    return;
+  }
+
+  // Empty STT: short peek window only, then VAD fallback for greeting keys.
+  const delays = greetingKey ? [250, 500, 800] : [400, 800, 1400, 2200];
   let step = 0;
 
   const tick = () => {
-    if (tryActivateFromStt()) return;
+    if (tryActivate('poll')) return;
     if (step >= delays.length) {
-      const buf = cleanTranscriptNoise(meta.userStreamBuffer || meta.userUtteranceBuffer || '');
+      const buf = sttBuffer();
+      if (shouldVadFallbackActivate({ chatbot: meta.chatbot, sttText: buf, speakMs })) {
+        activateSession(meta, buf || 'vad_timeout', { greet: true });
+        return;
+      }
       const keys = String(meta.chatbot?.activationKey || '').trim() || '(none)';
       console.log(
-        `[live] Wake STT finished — NOT activating (no DB keyword match). `
-        + `keys=[${keys}] buffer="${buf || '(empty)'}"`
+        `[live] Wake STT finished — NOT activating. keys=[${keys}] buffer="${toRomanDisplay(buf) || '(empty)'}"`
+        + ` spoke=${formatMs(speakMs)}`
       );
       meta.wakePending = false;
-      if (meta.wakeActivationTimer) {
-        clearTimeout(meta.wakeActivationTimer);
-        meta.wakeActivationTimer = null;
-      }
+      clearWakeTimer();
       return;
     }
     const wait = delays[step];
@@ -1415,9 +2431,10 @@ function endLiveConversation(socketId) {
     meta.wakeAudioEndTimer = null;
   }
 
+  invalidateWakeAttempts(meta);
+
   meta.isActivated = false;
   meta.activatedAt = 0;
-  meta.wakePending = false;
   meta.suppressOutput = true; // drop any leftover model audio/text until real wake
   // Block accidental re-wake from leftover speaker echo / mic noise after End Chat
   meta.ignoreWakeUntil = Date.now() + 5000;
@@ -1430,16 +2447,33 @@ function endLiveConversation(socketId) {
   meta.pendingSlideshow = null;
   meta.fullPdfPool = [];
   meta.slideshowEmittedKey = null;
+  meta.lockedPdfKey = null;
   meta.userUtteranceBuffer = '';
   meta.userStreamBuffer = '';
   meta.assistantBuffer = '';
   meta.spokenTurnText = '';
   meta.deferredShowImageIds = [];
   meta.greetNudgeSent = false;
+  meta.awaitingGreetingTurn = false;
+  meta.discardSttUntilTurnComplete = false;
+  meta.greetTurnUnlocked = false;
+  meta.turnRagCache = null;
+  meta.ragPrefetchInFlight = false;
   meta.topicDispatchedThisTurn = false;
   meta.lastSpeechEndAt = 0;
   meta.lastShownImageId = null;
   meta.lastSpeechSyncLen = 0;
+  meta.latency.turnId += 1;
+  meta.latency.userAudioStartAt = 0;
+  meta.latency.userSpeechEndAt = 0;
+  meta.latency.firstUserSttAt = 0;
+  meta.latency.firstModelAudioAt = 0;
+  meta.latency.firstModelTextAt = 0;
+  meta.latency.turnCompleteAt = 0;
+  meta.latency.ragStartedAt = 0;
+  meta.latency.ragMs = null;
+  meta.latency.loggedFirstAudio = false;
+  meta.latency.loggedComplete = false;
 
   emitJson(meta.socket, { type: 'chat_ended', reason: 'user_ended' });
   emitJson(meta.socket, { type: 'show_onboarding', reason: 'chat_ended' });
@@ -1450,6 +2484,7 @@ function endLiveConversation(socketId) {
 }
 
 async function stopGeminiLiveForSocket(socketId) {
+  cancelPendingSessionStop(socketId);
   const entry = getSessionEntry(socketId);
   if (!entry) return;
 
@@ -1460,6 +2495,17 @@ async function stopGeminiLiveForSocket(socketId) {
   } catch {
     /* ignore */
   }
+}
+
+/** Keep Gemini warm briefly so a socket reconnect does not pay ~14s handshake again. */
+function scheduleDelayedStopGemini(socketId, delayMs = 8000) {
+  cancelPendingSessionStop(socketId);
+  if (!liveSessions.has(socketId)) return;
+  const timer = setTimeout(() => {
+    pendingSessionStops.delete(socketId);
+    stopGeminiLiveForSocket(socketId).catch(() => {});
+  }, delayMs);
+  pendingSessionStops.set(socketId, timer);
 }
 
 function setMicEnabled(socketId, enabled) {
@@ -1478,6 +2524,7 @@ module.exports = {
   handleClientLatencyMark,
   endLiveConversation,
   stopGeminiLiveForSocket,
+  scheduleDelayedStopGemini,
   liveSessions,
   mergeLeadDraft,
   emitLeadForm,

@@ -69,11 +69,18 @@ function resolveSlideshowForTopicKey(catalog, topics, pdfKey) {
   );
 
   if (!topic) {
-    const fuzzy = topics.find(
-      (t) =>
-        normalizeKey(t.pdfKey).includes(normalizeKey(key))
-        || normalizeKey(key).includes(normalizeKey(t.pdfKey))
-    );
+    const needle = normalizeKey(key);
+    if (needle.length < 4) {
+      return { matched: false, pdfKey: key, pdfName: null, images: [] };
+    }
+    const fuzzy = topics.find((t) => {
+      const tk = normalizeKey(t.pdfKey);
+      const dn = normalizeKey(t.displayName);
+      if (tk === needle || dn === needle) return true;
+      if (needle.length >= 4 && (tk.includes(needle) || needle.includes(tk))) return true;
+      if (dn.length >= 4 && (dn.includes(needle) || needle.includes(dn))) return true;
+      return false;
+    });
     if (!fuzzy) {
       return { matched: false, pdfKey: key, pdfName: null, images: [] };
     }
@@ -125,6 +132,8 @@ const STOP_WORDS = new Set([
   'hai', 'hain', 'ka', 'ki', 'ke', 'ko', 'se', 'mein', 'main', 'aur', 'yeh', 'woh',
   'kya', 'aap', 'hum', 'par', 'per', 'ek', 'jo', 'to', 'bhi', 'nahi', 'nahin',
   'bata', 'batao', 'bataye', 'please', 'like', 'just',
+  'achha', 'acha', 'achcha', 'sorry', 'sawaal', 'sawal', 'great', 'question',
+  'briefly', 'explain', 'thinking', 'soch', 'theek', 'bilkul', 'zaroor',
 ]);
 
 function imageSearchBlob(img) {

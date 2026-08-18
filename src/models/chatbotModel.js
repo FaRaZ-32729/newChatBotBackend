@@ -22,7 +22,7 @@ const chatbotSchema = new mongoose.Schema({
             type: Date,
             default: Date.now
         },
-        extractedImages: [{                     // ← Yeh field add kiya
+        extractedImages: [{ 
             imageName: String,
             imageUrl: String,
             pageNumber: Number,
@@ -128,6 +128,16 @@ const chatbotSchema = new mongoose.Schema({
     },
 
     knowledgeCachedAt: {
+        type: Date,
+        default: null
+    },
+
+    knowledgeChunksBuilt: {
+        type: Boolean,
+        default: false
+    },
+
+    knowledgeChunksBuiltAt: {
         type: Date,
         default: null
     }
