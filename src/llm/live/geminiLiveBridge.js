@@ -85,7 +85,38 @@ function adoptLiveSession(entry, socket, fromSocketId) {
   cancelPendingSessionStop(fromSocketId);
   cancelPendingSessionStop(socket.id);
   entry.meta.socket = socket;
+  // New browser tab/refresh must start at wake — do not keep old "already answered" lock
+  if (fromSocketId && fromSocketId !== socket.id) {
+    resetWakeStateForNewClient(entry.meta);
+  }
   liveSessions.set(socket.id, entry);
+}
+
+function resetWakeStateForNewClient(meta) {
+  if (!meta) return;
+  cancelRagPrefetch(meta);
+  cancelInterruptHandoff(meta);
+  meta.isActivated = false;
+  meta.activatedAt = 0;
+  meta.silenceAfterAnswer = false;
+  meta.answerLockedThisTurn = false;
+  meta.dropBotUntilSpeechEnd = false;
+  meta.interruptedPending = false;
+  meta.suppressOutput = false;
+  meta.awaitingGreetingTurn = false;
+  meta.greetTurnUnlocked = false;
+  meta.greetNudgeSent = false;
+  meta.discardSttUntilTurnComplete = false;
+  meta.ignoreWakeUntil = 0;
+  meta.wakePending = false;
+  meta.userStreamBuffer = '';
+  meta.userUtteranceBuffer = '';
+  meta.lastEmittedUserStt = '';
+  meta.assistantBuffer = '';
+  meta.spokenTurnText = '';
+  meta.llmTopicSetThisTurn = false;
+  meta.lockedPdfKey = null;
+  console.log('[live] Rebound client reset — waiting for activation keyword');
 }
 
 function msBetween(start, end = Date.now()) {
@@ -97,6 +128,73 @@ function formatMs(ms) {
   if (ms == null) return 'n/a';
   if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`;
   return `${ms}ms`;
+}
+
+function cancelInterruptHandoff(meta) {
+  if (meta?.interruptHandoffTimer) {
+    clearTimeout(meta.interruptHandoffTimer);
+    meta.interruptHandoffTimer = null;
+  }
+}
+
+function beginUserInterrupt(meta, reason = 'barge-in') {
+  if (!meta?.isActivated) return;
+  cancelRagPrefetch(meta);
+  cancelInterruptHandoff(meta);
+  meta.interruptedPending = true;
+  meta.dropBotUntilSpeechEnd = true;
+  meta.assistantBuffer = '';
+  meta.spokenTurnText = '';
+  meta.deferredShowImageIds = [];
+  meta.topicDispatchedThisTurn = false;
+  meta.botResponseTurnId = null;
+  if (meta.isActivated) {
+    meta.userStreamBuffer = '';
+    meta.lastEmittedUserStt = '';
+    meta.userUtteranceBuffer = '';
+  }
+  console.log(`[live] Interrupt — stop previous answer (${reason})`);
+}
+
+function sendInterruptHandoff(meta) {
+  if (!meta?.interruptedPending || !meta.geminiSession) return;
+  const spoken = cleanTranscriptNoise(
+    meta.userStreamBuffer || meta.userUtteranceBuffer || meta.pendingRagQuery || ''
+  );
+  if (!spoken || spoken.length < 3) return;
+
+  meta.interruptedPending = false;
+  meta.dropBotUntilSpeechEnd = false;
+  cancelInterruptHandoff(meta);
+
+  try {
+    meta.geminiSession.sendClientContent({
+      turns: [{
+        role: 'user',
+        parts: [{
+          text:
+            '[USER_INTERRUPT] Your previous spoken answer is finished — stop as if you reached ".", "!" or "?". '
+            + 'Do NOT continue, resume, or repeat that answer. '
+            + `Answer ONLY this new visitor question (Roman): "${toRomanDisplay(spoken)}".`,
+        }],
+      }],
+      turnComplete: true,
+    });
+    console.log(`[live] Interrupt handoff → new question "${toRomanDisplay(spoken).slice(0, 80)}"`);
+  } catch (err) {
+    console.warn('[live] Interrupt handoff failed:', err.message);
+  }
+}
+
+function scheduleInterruptHandoff(meta, delayMs = 450) {
+  if (!meta?.interruptedPending) return;
+  cancelInterruptHandoff(meta);
+  const turnId = meta.latency?.turnId || 0;
+  meta.interruptHandoffTimer = setTimeout(() => {
+    meta.interruptHandoffTimer = null;
+    if ((meta.latency?.turnId || 0) !== turnId) return;
+    sendInterruptHandoff(meta);
+  }, delayMs);
 }
 
 function cancelRagPrefetch(meta) {
@@ -127,6 +225,8 @@ function resetTurnLatency(meta, reason = '') {
   meta.pendingRagQuery = '';
   meta.lockedPdfKey = null;
   meta.llmTopicSetThisTurn = false;
+  meta.answerLockedThisTurn = false;
+  meta.silenceAfterAnswer = false;
   meta.latency = {
     turnId: (meta.latency?.turnId || 0) + 1,
     reason: reason || '',
@@ -210,9 +310,21 @@ function markUserSpeechStart(meta, source = 'uplink') {
     return;
   }
 
+  const interrupting = Boolean(
+    meta.isActivated
+    && !meta.awaitingGreetingTurn
+    && L.firstModelAudioAt
+    && !L.turnCompleteAt
+  );
+
   resetTurnLatency(meta, source);
-  clearSlideshowForNewQuestion(meta);
   meta.botResponseTurnId = null;
+  meta.topicDispatchedThisTurn = false;
+  meta.imageShownThisTurn = false;
+  meta.deferredShowImageIds = [];
+  if (interrupting || meta.interruptedPending) {
+    beginUserInterrupt(meta, source);
+  }
   meta.latency.userAudioStartAt = Date.now();
   meta.latency.lastUserAudioAt = meta.latency.userAudioStartAt;
   console.log(`[LATENCY][BE] turn#${meta.latency.turnId} USER question started (${source})`);
@@ -240,6 +352,16 @@ function markUserSpeechEnd(meta, source = 'client') {
   L.userSpeechEndAt = Date.now();
   meta.botAnswerForTurnId = L.turnId;
   const spoke = speakDurationMs(L);
+  const likelyEcho = !L.firstUserSttAt && spoke != null && spoke < 900;
+  if (meta.interruptedPending) {
+    if (likelyEcho) {
+      meta.dropBotUntilSpeechEnd = true;
+    } else {
+      scheduleInterruptHandoff(meta, 450);
+    }
+  } else {
+    meta.dropBotUntilSpeechEnd = false;
+  }
   console.log(
     `[LATENCY][BE] turn#${L.turnId} USER speech end (${source}) — spoke ${formatMs(spoke)}`
   );
@@ -266,6 +388,7 @@ function markFirstModelAudio(meta) {
   if (meta.botResponseTurnId == null) {
     meta.botResponseTurnId = L.turnId;
   }
+  meta.answerLockedThisTurn = true;
   emitLatency(meta, 'first_bot_audio', {
     detail: `LLM first audio after speech-end ${formatMs(msBetween(L.userSpeechEndAt))}`,
   });
@@ -279,6 +402,7 @@ function markFirstModelText(meta) {
   if (meta.botResponseTurnId == null) {
     meta.botResponseTurnId = L.turnId;
   }
+  meta.answerLockedThisTurn = true;
   emitLatency(meta, 'first_bot_text');
 }
 
@@ -378,6 +502,11 @@ function createSessionMeta(socket, chatbot) {
     ragPrefetchTimer: null,
     pendingRagQuery: '',
     llmTopicSetThisTurn: false,
+    answerLockedThisTurn: false,
+    silenceAfterAnswer: false,
+    dropBotUntilSpeechEnd: false,
+    interruptedPending: false,
+    interruptHandoffTimer: null,
     botResponseTurnId: null,
     botAnswerForTurnId: null,
     lastSpeechEndAt: 0,
@@ -683,30 +812,7 @@ async function prefetchRagForUserQuestion(meta, rawQuery, forTurnId) {
       at: Date.now(),
     };
 
-    // Images are LLM-driven via setPresentationTopic — do not guess from STT here.
-
-    if (
-      chunks.length
-      && meta.geminiSession
-      && !meta.latency?.firstModelAudioAt
-      && !meta.latency?.firstModelTextAt
-    ) {
-      const body = formatChunksForPrompt(chunks);
-      meta.geminiSession.sendClientContent({
-        turns: [{
-          role: 'user',
-          parts: [{
-            text:
-              `[RAG_CONTEXT] Visitor question (Roman): "${toRomanDisplay(spoken)}". `
-              + 'Answer in AUDIO using ONLY these PDF excerpts. '
-              + 'Do NOT say documents are missing — the content is below:\n\n'
-              + body,
-          }],
-        }],
-        turnComplete: true,
-      });
-      console.log(`[live] Injected ${chunks.length} RAG chunk(s) before bot reply`);
-    }
+    // Do NOT inject RAG as a new user turn — that makes Gemini answer twice.
   } catch (err) {
     console.warn('[live] prefetch RAG failed:', err.message);
   } finally {
@@ -760,12 +866,14 @@ function collectImagesFromRagChunks(chunks, catalog) {
 function emitSlideshowPool(meta, result, initialSlideIndex = 0) {
   if (!result?.images?.length) return;
   const poolKey = `${result.pdfKey}:all`;
+  const alreadyShowing = meta.slideshowEmittedKey === poolKey;
   meta.slideshowEmittedKey = poolKey;
   meta.currentSlideshow = result.images;
   meta.pendingSlideshow = result.images;
   meta.fullPdfPool = result.images;
   meta.pendingPdfKey = result.pdfKey;
   meta.pendingPdfName = result.pdfName;
+  if (alreadyShowing) return;
   emitJson(meta.socket, {
     type: 'images',
     images: result.images.map(formatImageForFrontend),
@@ -800,22 +908,6 @@ function applyPresentationTopic(meta, topicKey, imageId = null, options = {}) {
       showOnboardingDisplay(meta, 'unknown_topic');
     }
     return { success: false, pdfKey: topicKey, reason: 'no_pdf_match' };
-  }
-
-  if (
-    meta.llmTopicSetThisTurn
-    && meta.lockedPdfKey
-    && result.pdfKey !== meta.lockedPdfKey
-    && !options.allowSwitch
-  ) {
-    console.log(
-      `[live] Ignore TOPIC "${topicKey}" (${result.pdfKey}) — this turn is locked to ${meta.lockedPdfKey}`
-    );
-    return {
-      success: false,
-      reason: 'topic_already_set',
-      pdfKey: meta.lockedPdfKey,
-    };
   }
 
   lockPdfKey(meta, result.pdfKey);
@@ -886,19 +978,16 @@ function emitImageSync(meta, catalogImageId, options = {}) {
   const preferred = findCatalogImageById(meta.catalog, catalogImageId);
   if (preferred && locked && preferred.pdfKey !== locked) {
     console.log(
-      `[live] Ignore SHOW_IMAGE:${catalogImageId} (${preferred.pdfKey}) — locked to ${locked}`
+      `[live] Topic switch SHOW_IMAGE:${catalogImageId} ${locked} → ${preferred.pdfKey}`
     );
+    applyPresentationTopic(meta, preferred.pdfKey, preferred.id, { allowSwitch: true, fromLlm: true });
     return;
   }
 
   if (preferred && (!pdfPool.length || !pdfPool.some((img) => img.pdfKey === preferred.pdfKey))) {
-    if (locked && preferred.pdfKey !== locked) {
-      pdfPool = poolForLockedPdf(meta);
-    } else {
-      pdfPool = (meta.catalog || []).filter((img) => img.pdfKey === preferred.pdfKey);
-    }
+    pdfPool = (meta.catalog || []).filter((img) => img.pdfKey === preferred.pdfKey);
   }
-  if (!pdfPool.length && preferred && (!locked || preferred.pdfKey === locked)) {
+  if (!pdfPool.length && preferred) {
     pdfPool = (meta.catalog || []).filter((img) => img.pdfKey === preferred.pdfKey);
   }
 
@@ -914,10 +1003,6 @@ function emitImageSync(meta, catalogImageId, options = {}) {
 
   if (!target) {
     console.warn(`[live] SHOW_IMAGE:${catalogImageId} — not found in catalog`);
-    return;
-  }
-  if (locked && target.pdfKey !== locked) {
-    console.log(`[live] Drop image ${target.id} (${target.pdfKey}) — locked to ${locked}`);
     return;
   }
 
@@ -1065,39 +1150,30 @@ function parseAssistantMarkers(meta, chunkText) {
   meta.assistantBuffer = appendTranscript(meta.assistantBuffer, chunkText);
   let buffer = meta.assistantBuffer;
 
-  // Process TOPIC markers (may appear once per turn)
-  const topicMatch = buffer.match(/\[\[TOPIC:\s*([^\]]+?)\]\]/i);
-  if (topicMatch) {
+  // Process every [[TOPIC:]] — LLM may switch product mid-answer (Gateway then Ecosystem)
+  let topicMatch;
+  while ((topicMatch = buffer.match(/\[\[TOPIC:\s*([^\]]+?)\]\]/i))) {
     const topic = topicMatch[1].trim();
     buffer = buffer.replace(topicMatch[0], '');
-
-    if (!meta.topicDispatchedThisTurn) {
-      meta.topicDispatchedThisTurn = true;
-      const key = topic.toLowerCase();
-      if (key !== 'general') {
-        meta.topicCounts[key] = (meta.topicCounts[key] || 0) + 1;
-      }
-      if (!meta.awaitingGreetingTurn || key === 'general') {
-        dispatchSlideshowForTopic(meta, topic, { fromLlm: true, force: true });
-      }
+    const key = topic.toLowerCase();
+    if (key !== 'general') {
+      meta.topicCounts[key] = (meta.topicCounts[key] || 0) + 1;
+    }
+    if (!meta.awaitingGreetingTurn || key === 'general') {
+      dispatchSlideshowForTopic(meta, topic, { fromLlm: true, force: true, allowSwitch: true });
     }
   }
 
-  // SHOW_IMAGE — only after topic is locked; ignore ids from other PDFs
+  // SHOW_IMAGE follows whatever product the LLM is talking about now
   let imageMatch;
   while ((imageMatch = buffer.match(/\[\[SHOW_IMAGE:(\d+)\]\]/i))) {
     const imageId = parseInt(imageMatch[1], 10);
     buffer = buffer.replace(imageMatch[0], '');
-    if (!meta.llmTopicSetThisTurn && !meta.lockedPdfKey) {
-      if (!Array.isArray(meta.deferredShowImageIds)) meta.deferredShowImageIds = [];
-      meta.deferredShowImageIds.push(imageId);
-      continue;
-    }
-    if (String(meta.spokenTurnText || '').trim().length < 40) {
+    if (String(meta.spokenTurnText || '').trim().length < 24) {
       if (!Array.isArray(meta.deferredShowImageIds)) meta.deferredShowImageIds = [];
       meta.deferredShowImageIds.push(imageId);
     } else {
-      emitImageSync(meta, imageId);
+      emitImageSync(meta, imageId, { fromLlm: true, force: true });
     }
   }
 
@@ -1242,6 +1318,35 @@ async function handleToolCall(toolCall, meta) {
       const query = String(args.query || '').trim();
       const pdfKey = String(args.pdfKey || '').trim() || undefined;
 
+      if (meta.silenceAfterAnswer || meta.dropBotUntilSpeechEnd) {
+        responses.push({
+          id: call.id,
+          name: call.name,
+          response: {
+            result: 'STOP. The spoken answer is already done. Output NO more audio. Do not repeat. Do not search.',
+            matchCount: 0,
+            skip: true,
+          },
+        });
+        console.log('[live] searchKnowledgeBase skipped — answer already finished');
+        continue;
+      }
+
+      if (meta.answerLockedThisTurn) {
+        responses.push({
+          id: call.id,
+          name: call.name,
+          response: {
+            result:
+              'STOP. You already started speaking this answer. Do NOT restart. Do NOT produce a second full answer. Finish the current sentence only, then silence.',
+            matchCount: 0,
+            skip: true,
+          },
+        });
+        console.log('[live] searchKnowledgeBase skipped — already speaking this turn');
+        continue;
+      }
+
       if (
         meta.awaitingGreetingTurn
         || (
@@ -1305,11 +1410,13 @@ async function handleToolCall(toolCall, meta) {
         const emptyRag = 'SEARCH RETURNED 0 RESULTS. Say politely you could not find that exact detail in the indexed excerpts, then offer to help with another topic from your documents. Do NOT invent pricing or specs.';
         const topKey = chunks[0]?.pdfKey || pdfKey || resolvedPdfKey || '';
         const topImageId = chunks[0]?.relatedImageIds?.[0];
-        const imageRule = topKey
-          ? `\n\nREQUIRED BEFORE SPEAKING: call setPresentationTopic(pdfKey="${topKey}"${topImageId ? `, imageId=${topImageId}` : ''}). `
-            + 'Use the pdfKey that matches the VISITOR QUESTION MEANING (machinery/dashboard → ecosystem_pdf, AC → ac_pdf, solar → easy_solar). '
-            + 'Ignore garbled STT. Then emit [[SHOW_IMAGE:N]] as you speak each point.'
-          : '\n\nREQUIRED: call setPresentationTopic with the correct pdfKey before speaking.';
+        const alreadySpeaking = Boolean(meta.latency?.firstModelAudioAt || meta.latency?.firstModelTextAt);
+        const imageRule = alreadySpeaking
+          ? '\n\nYou are ALREADY answering out loud. Use these excerpts if needed. Do NOT restart the answer. Do NOT repeat the intro. Continue only if a fact was missing.'
+          : (topKey
+            ? `\n\nREQUIRED BEFORE SPEAKING: call setPresentationTopic(pdfKey="${topKey}"${topImageId ? `, imageId=${topImageId}` : ''}). `
+              + 'Then speak the answer once. Do not restart after tools.'
+            : '\n\nREQUIRED: call setPresentationTopic with the correct pdfKey before speaking.');
         responses.push({
           id: call.id,
           name: call.name,
@@ -1345,11 +1452,30 @@ async function handleToolCall(toolCall, meta) {
       const args = call.args || {};
       const pdfKey = String(args.pdfKey || '').trim();
       const imageId = args.imageId != null ? Number(args.imageId) : null;
-      const outcome = applyPresentationTopic(meta, pdfKey, imageId, { fromLlm: true });
+      if (meta.silenceAfterAnswer || meta.dropBotUntilSpeechEnd) {
+        responses.push({
+          id: call.id,
+          name: call.name,
+          response: {
+            success: true,
+            skip: true,
+            instruction: 'STOP. Answer already finished. No more audio.',
+          },
+        });
+        continue;
+      }
+      const outcome = applyPresentationTopic(meta, pdfKey, imageId, { fromLlm: true, allowSwitch: true });
+      const alreadySpeaking = Boolean(meta.latency?.firstModelAudioAt || meta.latency?.firstModelTextAt);
       responses.push({
         id: call.id,
         name: call.name,
-        response: outcome,
+        response: {
+          ...outcome,
+          continueSpeaking: alreadySpeaking,
+          instruction: alreadySpeaking
+            ? 'Images are on screen. Continue the SAME spoken answer. Do NOT restart or repeat.'
+            : 'Images are on screen. Speak the answer once. Do not call this tool again this turn.',
+        },
       });
       console.log(
         `[live] setPresentationTopic "${pdfKey}" → ${outcome.success ? 'ok' : outcome.reason}`
@@ -1463,6 +1589,8 @@ function flushUserTranscript(meta) {
     if (
       !meta.leadFormShown
       && !meta.awaitingGreetingTurn
+      && !meta.latency?.firstModelAudioAt
+      && !meta.latency?.turnCompleteAt
       && shouldDispatchImagesForUtterance(full)
       && !isActivationOnlyUtterance(full, meta.chatbot)
     ) {
@@ -1577,9 +1705,11 @@ function activateSession(meta, heard, { greet = false } = {}) {
 
   if (greet && meta.geminiSession) {
     meta.awaitingGreetingTurn = true;
-    meta.greetTurnUnlocked = false;
-    meta.suppressOutput = true;
-    meta.discardSttUntilTurnComplete = true;
+    meta.greetTurnUnlocked = true;
+    meta.suppressOutput = false;
+    meta.discardSttUntilTurnComplete = false;
+    meta.silenceAfterAnswer = false;
+    meta.answerLockedThisTurn = false;
 
     const wakeDisplay = toRomanDisplay(
       String(heard || meta.userStreamBuffer || '').trim()
@@ -1660,6 +1790,9 @@ function accumulateUserTranscript(meta, chunk) {
 
   if (meta.isActivated) {
     markFirstUserStt(meta, cleaned);
+    if (meta.interruptedPending && meta.latency?.userSpeechEndAt) {
+      scheduleInterruptHandoff(meta, 200);
+    }
     if (meta.latency?.userSpeechEndAt) {
       scheduleRagPrefetch(meta, meta.userStreamBuffer, 350);
     }
@@ -1691,6 +1824,10 @@ function stripMarkerText(text) {
 function handleLiveMessage(meta, message) {
   if (message.toolCall) {
     if (!meta.isActivated) return;
+    if (meta.dropBotUntilSpeechEnd) {
+      console.log('[live] Drop leftover tool call after interrupt');
+      return;
+    }
     emitLatency(meta, 'tool_call', { detail: (message.toolCall.functionCalls || []).map((c) => c.name).join(',') });
     handleToolCall(message.toolCall, meta).catch((err) => {
       console.error('[live] Tool call error:', err.message);
@@ -1717,19 +1854,7 @@ function handleLiveMessage(meta, message) {
     if (meta.isActivated && !meta.suppressOutput) {
       emitJson(meta.socket, { type: 'interrupted' });
     }
-    meta.assistantBuffer = '';
-    meta.spokenTurnText = '';
-    meta.imageShownThisTurn = false;
-    meta.lastShownImageId = null;
-    meta.lastSpeechSyncLen = 0;
-    meta.deferredShowImageIds = [];
-    meta.botResponseTurnId = null;
-    // Never wipe user STT on interrupt — wake keyword lives in this buffer
-    if (meta.isActivated) {
-      meta.userStreamBuffer = '';
-      meta.lastEmittedUserStt = '';
-    }
-    meta.topicDispatchedThisTurn = false;
+    beginUserInterrupt(meta, 'gemini_interrupted');
   }
 
   const sttText = sc.inputTranscription?.text;
@@ -1750,6 +1875,7 @@ function handleLiveMessage(meta, message) {
           continue;
         }
       }
+      if (meta.dropBotUntilSpeechEnd || meta.silenceAfterAnswer) continue;
       if (!meta.isActivated) {
         if (meta.ignoreWakeUntil && Date.now() < meta.ignoreWakeUntil) continue;
         const buf = String(meta.userStreamBuffer || '').trim();
@@ -1763,7 +1889,9 @@ function handleLiveMessage(meta, message) {
   }
 
   if (sc.outputTranscription?.text) {
-    if (meta.isActivated && !meta.suppressOutput) {
+    if (meta.dropBotUntilSpeechEnd || meta.silenceAfterAnswer) {
+      meta.assistantBuffer = '';
+    } else if (meta.isActivated && !meta.suppressOutput) {
       markFirstModelText(meta);
       parseAssistantMarkers(meta, sc.outputTranscription.text);
     } else {
@@ -1775,21 +1903,15 @@ function handleLiveMessage(meta, message) {
   if (sc.turnComplete) {
     if (meta.awaitingGreetingTurn && meta.suppressOutput) {
       meta.greetTurnUnlocked = true;
+      meta.suppressOutput = false;
       meta.discardSttUntilTurnComplete = false;
-      meta.userStreamBuffer = '';
-      meta.lastEmittedUserStt = '';
-      meta.assistantBuffer = '';
-      meta.spokenTurnText = '';
-      meta.deferredShowImageIds = [];
-      meta.topicDispatchedThisTurn = false;
-      console.log('[live] Dropped spurious wake-turn reply — waiting for greeting');
-      return;
+      console.log('[live] Greeting turn — allowing bot audio');
     }
 
-    if (isStaleBotTurnComplete(meta)) {
+    if (isStaleBotTurnComplete(meta) || meta.dropBotUntilSpeechEnd || meta.silenceAfterAnswer) {
       console.log(
-        `[live] Ignoring stale turn_complete — bot turn#${meta.botResponseTurnId}`
-        + `, current turn#${meta.latency?.turnId}`
+        `[live] Ignoring extra turn_complete — already answered this question`
+        + `${meta.silenceAfterAnswer ? ' (silenceAfterAnswer)' : ''}`
       );
       meta.assistantBuffer = '';
       meta.spokenTurnText = '';
@@ -1811,6 +1933,8 @@ function handleLiveMessage(meta, message) {
       flushDeferredShowImages(meta, true);
       flushAssistantTranscript(meta);
       emitJson(meta.socket, { type: 'turn_complete' });
+      meta.silenceAfterAnswer = true;
+      console.log('[live] Answer complete — blocking repeat generation until next user question');
     }
     if (meta.awaitingGreetingTurn && !meta.suppressOutput) {
       meta.awaitingGreetingTurn = false;
@@ -2114,13 +2238,8 @@ function interruptLiveSession(socketId) {
   // Frontend already stops local playback; clear local turn buffers only.
   try {
     const meta = entry.meta;
-    meta.assistantBuffer = '';
-    meta.spokenTurnText = '';
-    meta.deferredShowImageIds = [];
-    meta.topicDispatchedThisTurn = false;
-    meta.botResponseTurnId = null;
-    cancelRagPrefetch(meta);
-    console.log(`[live] Barge-in (socket ${socketId}) — waiting for user audio`);
+    beginUserInterrupt(meta, 'frontend_barge_in');
+    console.log(`[live] Barge-in (socket ${socketId}) — previous answer stopped`);
     return true;
   } catch {
     return false;
@@ -2307,6 +2426,7 @@ function handleClientLatencyMark(socketId, payload = {}) {
       );
       if (buf) {
         scheduleRagPrefetch(entry.meta, buf, 650);
+        scheduleInterruptHandoff(entry.meta, 450);
       }
     }
   }
